@@ -1,0 +1,5 @@
+# One requirement per line, pip syntax. Pin what you need; unpinned lines take
+# the newest release that has a wheel for this target.
+requests==2.32.5
+PyYAML
+packaging
