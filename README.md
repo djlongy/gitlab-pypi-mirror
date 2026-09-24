@@ -66,8 +66,11 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
 
 - `sync.sh` pulls, downloads every target into `packages/<target>/wheelhouse/`,
   commits, and pushes. `--no-push` stops after the commit; `--target` limits the run.
-- With `GITLAB_API_URL`, `PYPI_PROJECT` and `PYPI_TOKEN` set, `sync.sh` first deletes
-  downloaded files the registry already holds, so the push carries only new files.
+- With `GITLAB_API_URL`, `PYPI_PROJECT` and `PYPI_TOKEN` set, `sync.sh` removes the
+  local copy of each wheel the registry already holds. Wheels the registry lacks stay
+  in `wheelhouse/` and are pushed for the pipeline to upload. Nothing is removed from
+  the registry. Without those three variables every wheel is pushed and `publish`
+  skips the ones already uploaded.
 - A push to the default branch that changes `packages/` runs `publish`, which asks
   the registry's simple index which files it holds and uploads only the rest.
   Running the pipeline from the web UI rechecks every file.

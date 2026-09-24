@@ -14,9 +14,10 @@
 #   PIP_CERT                  CA bundle pip should trust (TLS-inspecting proxy)
 #   PYTHON                    interpreter to run (default python3, needs 3.8+)
 #   GITLAB_API_URL, PYPI_PROJECT, PYPI_TOKEN
-#                             optional: with all three set, files the registry
-#                             already holds are deleted before the commit, so
-#                             the push carries only what is missing
+#                             optional: with all three set, the local copy of
+#                             each wheel the registry already holds is removed
+#                             before the commit; wheels it lacks are pushed for
+#                             the pipeline to upload. The registry is untouched.
 set -euo pipefail
 cd "$(dirname "$0")"
 
