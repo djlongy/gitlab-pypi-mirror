@@ -1,0 +1,3 @@
+# Python 3.9 needs older pins than 3.12: newer releases dropped 3.9.
+requests==2.32.4
+PyYAML==6.0.2

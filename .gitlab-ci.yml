@@ -1,0 +1,43 @@
+# Uploads packages/*/wheelhouse/* to this project's PyPI package registry,
+# skipping every file the registry already has.
+#
+# Runs on any executor: a docker runner uses PYTHON_IMAGE, a shell runner
+# needs python3 (3.8+) on the host. No network access beyond this GitLab.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  # Any image with python3 3.8 or newer. Point it at your internal registry.
+  PYTHON_IMAGE: python:3.12-slim
+  GIT_DEPTH: "1"
+
+default:
+  image: $PYTHON_IMAGE
+
+stages:
+  - test
+  - publish
+
+test:
+  stage: test
+  script:
+    - python3 mirror.py targets
+    - python3 -m unittest discover -s tests
+
+publish:
+  stage: publish
+  # Two pipelines publishing at once would both see a file as missing.
+  resource_group: pypi-registry
+  script:
+    - python3 mirror.py publish
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+      changes:
+        - packages/**/*
+    # Run pipeline / schedule / API on the default branch: re-check everything.
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(web|schedule|api)$/
