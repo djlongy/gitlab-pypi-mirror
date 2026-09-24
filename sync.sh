@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Download every target, drop what the registry already has, commit and push.
+# Download every target, commit and push. Wheels already in the repository
+# stay; the push triggers the pipeline that uploads whatever the registry lacks.
 #
 # Run on the machine that can reach PyPI (directly or through HTTPS_PROXY).
-# The push triggers the pipeline that uploads the new files to the registry.
 #
 #   ./sync.sh                         all targets, commit and push
 #   ./sync.sh --target linux-py3.12   one target (repeatable)
 #   ./sync.sh --no-push               download and commit only
+#   ./sync.sh --prune                 also remove the repository's copy of every
+#                                     wheel the registry already holds
 #
 # Environment:
 #   HTTPS_PROXY / HTTP_PROXY  proxy for pip; put your GitLab host in NO_PROXY
@@ -14,21 +16,20 @@
 #   PIP_CERT                  CA bundle pip should trust (TLS-inspecting proxy)
 #   PYTHON                    interpreter to run (default python3, needs 3.8+)
 #   GITLAB_API_URL, PYPI_PROJECT, PYPI_TOKEN
-#                             optional: with all three set, the local copy of
-#                             each wheel the registry already holds is removed
-#                             before the commit; wheels it lacks are pushed for
-#                             the pipeline to upload. The registry is untouched.
+#                             required with --prune only
 set -euo pipefail
 cd "$(dirname "$0")"
 
 PYTHON=${PYTHON:-python3}
 push=1
+prune=0
 args=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-push) push=0 ;;
+    --prune) prune=1 ;;
     --target) args+=(--target "$2"); shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -44,10 +45,8 @@ fi
 git pull --rebase --autostash
 "$PYTHON" mirror.py download ${args[@]+"${args[@]}"}
 
-if [ -n "${GITLAB_API_URL:-}" ] && [ -n "${PYPI_PROJECT:-}" ] && [ -n "${PYPI_TOKEN:-}" ]; then
+if [ "$prune" = 1 ]; then
   "$PYTHON" mirror.py prune ${args[@]+"${args[@]}"}
-else
-  echo "GITLAB_API_URL, PYPI_PROJECT or PYPI_TOKEN unset: not pruning; CI skips what the registry has"
 fi
 
 git add --all packages
