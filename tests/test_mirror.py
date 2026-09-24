@@ -8,6 +8,8 @@ import base64
 import io
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -22,6 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import mirror  # noqa: E402
 
 TOKEN = "t0ken"
+# The test environment is cleared, so the shell tests get a PATH of their own.
+SHELL_PATH = os.pathsep.join(os.path.dirname(shutil.which(t) or "/usr/bin") for t in ("curl", "unzip", "sha256sum", "sh"))
 UPSTREAM_FILES = ["idna-3.20-py3-none-any.whl", "requests-2.32.5-py3-none-any.whl"]
 
 
@@ -185,13 +189,16 @@ class FileNameTests(unittest.TestCase):
         self.assertEqual(mirror.normalize("Zope.Interface__x"), "zope-interface-x")
 
 
-class RegistryTests(Workspace):
+class FakeRegistry(Workspace):
+    """A running FakeGitLab, with the CI variables pointing at it."""
+
     def setUp(self):
         super().setUp()
         FakeGitLab.files = {}
         self.server = HTTPServer(("127.0.0.1", 0), FakeGitLab)
         self.server.forward = False
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         env = {
             "CI_API_V4_URL": f"http://127.0.0.1:{self.server.server_port}/api/v4",
@@ -202,6 +209,8 @@ class RegistryTests(Workspace):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+
+class RegistryTests(FakeRegistry):
     def run_cli(self, *argv):
         out = io.StringIO()
         with redirect_stdout(out):
@@ -294,3 +303,64 @@ class RegistryTests(Workspace):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(
+    all(shutil.which(t) for t in ("curl", "unzip", "sha256sum")), "publish.sh needs curl, unzip, sha256sum"
+)
+class ShellPublishTests(FakeRegistry):
+    """publish.sh, the curl fallback, against the same fake registry."""
+
+    def run_sh(self, *argv):
+        env = dict(os.environ, PACKAGES_DIR=str(self.packages), PATH=SHELL_PATH)
+        result = subprocess.run(
+            ["sh", str(Path(mirror.__file__).with_name("publish.sh")), *argv],
+            env=env, capture_output=True, text=True,
+        )
+        return result.returncode, result.stdout, result.stderr
+
+    def test_uploads_only_what_is_missing_and_a_rerun_uploads_nothing(self):
+        linux = self.target("linux-py3.12")
+        windows = self.target("windows-py3.12")
+        make_wheel(linux, "requests-2.32.5-py3-none-any.whl", "<4,>=3.9")
+        make_wheel(windows, "requests-2.32.5-py3-none-any.whl", "<4,>=3.9")
+        make_wheel(windows, "pywin32-312-cp312-cp312-win_amd64.whl")
+        FakeGitLab.files["pywin32"] = {"pywin32-312-cp312-cp312-win_amd64.whl": {}}
+        code, out, err = self.run_sh()
+        self.assertEqual(code, 0, err)
+        self.assertIn("2 file(s): 1 uploaded, 1 already in the registry", out)
+        fields = FakeGitLab.files["requests"]["requests-2.32.5-py3-none-any.whl"]
+        # A --form value starting with < would make curl read a file of that name.
+        self.assertEqual(fields["requires_python"], "<4,>=3.9")
+        self.assertEqual(fields["version"], "2.32.5")
+        self.assertEqual(len(fields["sha256_digest"]), 64)
+        code, out, err = self.run_sh()
+        self.assertIn("0 uploaded, 2 already in the registry", out)
+
+    def test_a_forwarded_lookup_is_not_read_as_the_registrys_own_files(self):
+        self.server.forward = True
+        make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")
+        code, out, err = self.run_sh()
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 file(s): 1 uploaded, 0 already in the registry", out)
+
+    def test_a_source_distribution_is_never_uploaded(self):
+        wheelhouse = self.target("linux-py3.12")
+        (wheelhouse / "pkg-0.1.tar.gz").write_bytes(b"not a wheel")
+        code, out, err = self.run_sh()
+        self.assertEqual(code, 0, err)
+        self.assertIn("0 file(s)", out)
+        self.assertIn("ignoring linux-py3.12/wheelhouse/pkg-0.1.tar.gz", err)
+
+    def test_dry_run_uploads_nothing(self):
+        make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")
+        code, out, err = self.run_sh("--dry-run")
+        self.assertIn("would upload idna-3.20-py3-none-any.whl", out)
+        self.assertEqual(FakeGitLab.files, {})
+
+    def test_a_wrong_token_fails(self):
+        make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")
+        os.environ["CI_JOB_TOKEN"] = "wrong"
+        code, out, err = self.run_sh()
+        self.assertNotEqual(code, 0)
+        self.assertIn("HTTP 401", err)

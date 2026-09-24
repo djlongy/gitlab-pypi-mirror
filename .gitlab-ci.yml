@@ -1,8 +1,9 @@
 # Uploads packages/*/wheelhouse/* to this project's PyPI package registry,
 # skipping every file the registry already has.
 #
-# Runs on any executor: a docker runner uses PYTHON_IMAGE, a shell runner
-# needs python3 (3.8+) on the host. No network access beyond this GitLab.
+# Runs on any executor: a docker runner uses PYTHON_IMAGE, a shell runner uses
+# the host. python3 (3.8+) runs mirror.py; without it, publish.sh does the same
+# upload with curl, unzip and sha256sum. No network access beyond this GitLab.
 
 workflow:
   rules:
@@ -12,7 +13,8 @@ workflow:
     - if: $CI_COMMIT_BRANCH
 
 variables:
-  # Any image with python3 3.8 or newer. Point it at your internal registry.
+  # Any image with python3 3.8+, or with curl, unzip and sha256sum. Point it at
+  # your internal registry.
   PYTHON_IMAGE: python:3.12-slim
   GIT_DEPTH: "1"
 
@@ -26,15 +28,26 @@ stages:
 test:
   stage: test
   script:
-    - python3 mirror.py targets
-    - python3 -m unittest discover -s tests
+    - |
+      if command -v python3 >/dev/null 2>&1; then
+        python3 mirror.py targets
+        python3 -m unittest discover -s tests
+      else
+        echo "no python3 here: checking publish.sh syntax only"
+        sh -n publish.sh
+      fi
 
 publish:
   stage: publish
   # Two pipelines publishing at once would both see a file as missing.
   resource_group: pypi-registry
   script:
-    - python3 mirror.py publish
+    - |
+      if command -v python3 >/dev/null 2>&1; then
+        python3 mirror.py publish
+      else
+        sh publish.sh
+      fi
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
       changes:
