@@ -7,8 +7,9 @@ Mirrors Python packages for chosen OS and Python versions into a GitLab PyPI pac
 - A download machine that reaches PyPI directly or through an HTTP proxy, with
   Python 3.8+, pip, git and git-lfs.
 - GitLab with the package registry and Git LFS enabled on this project.
-- A runner of any executor: docker runs `PYTHON_IMAGE`, shell needs `python3` 3.8+.
-  The runner needs no internet access.
+- A runner of any executor, with `python3` 3.8+ or with `curl`, `unzip` and
+  `sha256sum` (any busybox image). Without Python the pipeline publishes with
+  `publish.sh`. The runner needs no internet access.
 
 ## Targets
 
@@ -46,8 +47,8 @@ The full set is in the argument parser and `Registry.from_env` in `mirror.py`.
 | With `--prune` | `GITLAB_API_URL` | `$CI_API_V4_URL` | `https://gitlab.example.com/api/v4` |
 | With `--prune` | `PYPI_PROJECT` | `$CI_PROJECT_ID` | Project path or id that holds the registry |
 | With `--prune` | `PYPI_TOKEN` | `$CI_JOB_TOKEN` | Token with `read_api`; `write_registry` too to publish from outside CI |
-| Optional | `CA_BUNDLE` | system store | CA bundle for the GitLab API |
-| Optional | `PYTHON_IMAGE` (CI) | `python:3.12-slim` | Job image; point it at your internal registry |
+| Optional | `CA_BUNDLE` | system store | CA file for the GitLab API. Replaces the system store, so it holds the full chain |
+| Optional | `PYTHON_IMAGE` (CI) | `python:3.12-slim` | Job image with Python, or with curl, unzip and sha256sum; point it at your internal registry |
 
 ## Usage
 
