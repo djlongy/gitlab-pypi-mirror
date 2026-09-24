@@ -23,10 +23,13 @@ name is read.
 | `windows-py3.9` | CPython 3.9, Windows x64 (`win_amd64`) |
 | `windows-py3.13-arm64` | CPython 3.13, Windows on Arm |
 
-Optional files in a target directory:
+Only wheels are downloaded and published, for every package and every dependency.
+A package with no wheel for a target fails that target's download, and a non-wheel
+file in a `wheelhouse/` is ignored with a warning. Pin a release that has a wheel,
+or build one elsewhere and add it to the `wheelhouse/`.
 
-- `platforms.txt`: pip platform tags, one per line, replacing the defaults.
-- `sdist.txt`: packages published only as source, downloaded without dependencies.
+Optional in a target directory: `platforms.txt`, pip platform tags, one per line,
+replacing the defaults.
 
 Two targets that resolve the same file upload it once.
 
@@ -77,7 +80,7 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
 
 ## Out of scope
 
-- Building wheels from source for a platform with none on PyPI.
+- Source distributions, and building wheels from them.
 - Removing packages from the registry.
 - Scanning packages for vulnerabilities or licences.
 
