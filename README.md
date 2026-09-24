@@ -43,9 +43,9 @@ The full set is in the argument parser and `Registry.from_env` in `mirror.py`.
 | Optional | `PIP_INDEX_URL` | pypi.org | A PyPI mirror to download from instead |
 | Optional | `PIP_CERT` | system store | CA bundle pip trusts, for a TLS-inspecting proxy |
 | Optional | `MANYLINUX` | `2_28` | Newest glibc your Linux hosts run, as `2_<minor>` |
-| When pruning | `GITLAB_API_URL` | `$CI_API_V4_URL` | `https://gitlab.example.com/api/v4` |
-| When pruning | `PYPI_PROJECT` | `$CI_PROJECT_ID` | Project path or id that holds the registry |
-| When pruning | `PYPI_TOKEN` | `$CI_JOB_TOKEN` | Token with `read_api`; `write_registry` too to publish from outside CI |
+| With `--prune` | `GITLAB_API_URL` | `$CI_API_V4_URL` | `https://gitlab.example.com/api/v4` |
+| With `--prune` | `PYPI_PROJECT` | `$CI_PROJECT_ID` | Project path or id that holds the registry |
+| With `--prune` | `PYPI_TOKEN` | `$CI_JOB_TOKEN` | Token with `read_api`; `write_registry` too to publish from outside CI |
 | Optional | `CA_BUNDLE` | system store | CA bundle for the GitLab API |
 | Optional | `PYTHON_IMAGE` (CI) | `python:3.12-slim` | Job image; point it at your internal registry |
 
@@ -66,11 +66,11 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
 
 - `sync.sh` pulls, downloads every target into `packages/<target>/wheelhouse/`,
   commits, and pushes. `--no-push` stops after the commit; `--target` limits the run.
-- With `GITLAB_API_URL`, `PYPI_PROJECT` and `PYPI_TOKEN` set, `sync.sh` removes the
-  local copy of each wheel the registry already holds. Wheels the registry lacks stay
-  in `wheelhouse/` and are pushed for the pipeline to upload. Nothing is removed from
-  the registry. Without those three variables every wheel is pushed and `publish`
-  skips the ones already uploaded.
+- Every wheel stays in the repository, so it is also the archive the registry can
+  be rebuilt from. A rerun downloads only files not already in `wheelhouse/`.
+- `sync.sh --prune` instead removes the repository's copy of each wheel the registry
+  already holds, keeping the repository small. It needs `GITLAB_API_URL`,
+  `PYPI_PROJECT` and `PYPI_TOKEN`, and never removes anything from the registry.
 - A push to the default branch that changes `packages/` runs `publish`, which asks
   the registry's simple index which files it holds and uploads only the rest.
   Running the pipeline from the web UI rechecks every file.
