@@ -5,7 +5,7 @@ Two halves, one file, standard library only:
 
   On a machine that can reach PyPI (directly or through an HTTP proxy):
       mirror.py download      pip-download every packages/<target>/requirements.txt
-      mirror.py prune         delete downloaded files the registry already has
+      mirror.py prune         remove local copies of wheels the registry already has
 
   In GitLab CI, where the runner cannot reach PyPI:
       mirror.py publish       upload every downloaded file the registry lacks
@@ -362,7 +362,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         ("targets", cmd_targets, "list the targets under packages/ and how each is read"),
         ("download", cmd_download, "pip download every target into its wheelhouse/"),
         ("publish", cmd_publish, "upload wheelhouse files the registry does not have"),
-        ("prune", cmd_prune, "delete wheelhouse files the registry already has"),
+        ("prune", cmd_prune, "remove local copies of wheels the registry already has"),
     ):
         command = sub.add_parser(name, help=text)
         command.add_argument("--target", action="append", help="limit to this target (repeatable)")
