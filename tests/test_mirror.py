@@ -165,17 +165,21 @@ class TargetTests(Workspace):
 
 
 class FileNameTests(unittest.TestCase):
-    def test_wheel_and_sdist_names(self):
+    def test_wheel_names(self):
         cases = {
             "PyYAML-6.0.2-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl": ("PyYAML", "6.0.2"),
             "pywin32-312-cp312-cp312-win_amd64.whl": ("pywin32", "312"),
             "foo-1.0-1-py3-none-any.whl": ("foo", "1.0"),
-            "python-dateutil-2.8.2.tar.gz": ("python-dateutil", "2.8.2"),
-            "pkg-0.1.zip": ("pkg", "0.1"),
         }
         for filename, expected in cases.items():
             with self.subTest(filename):
                 self.assertEqual(mirror.name_and_version(filename), expected)
+
+    def test_a_source_distribution_is_not_a_package_name(self):
+        for filename in ("python-dateutil-2.8.2.tar.gz", "pkg-0.1.zip", "pkg-0.1-py3.whl"):
+            with self.subTest(filename):
+                with self.assertRaises(mirror.MirrorError):
+                    mirror.name_and_version(filename)
 
     def test_normalize(self):
         self.assertEqual(mirror.normalize("Zope.Interface__x"), "zope-interface-x")
@@ -237,6 +241,20 @@ class RegistryTests(Workspace):
         code, out = self.run_cli("publish")
         self.assertEqual(code, 0, out)
         self.assertIn("1 file(s): 1 uploaded, 0 already in the registry", out)
+
+    def test_a_source_distribution_in_a_wheelhouse_is_never_uploaded(self):
+        """Air-gapped hosts have no compiler: an sdist in the registry is a
+        package pip can find there and cannot install."""
+        wheelhouse = self.target("linux-py3.12")
+        make_wheel(wheelhouse, "idna-3.20-py3-none-any.whl")
+        (wheelhouse / "pkg-0.1.tar.gz").write_bytes(b"not a wheel")
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code, out = self.run_cli("publish")
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 file(s): 1 uploaded", out)
+        self.assertNotIn("pkg", FakeGitLab.files)
+        self.assertIn("ignoring packages/linux-py3.12/wheelhouse/pkg-0.1.tar.gz", err.getvalue())
 
     def test_dry_run_uploads_nothing(self):
         make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")

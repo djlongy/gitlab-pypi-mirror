@@ -34,7 +34,6 @@ import re
 import ssl
 import subprocess
 import sys
-import tarfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,7 +52,6 @@ ARCHES = {"linux": {"x86_64", "aarch64"}, "windows": {"amd64", "arm64", "win32"}
 # Newest glibc the Linux hosts have: 2_28 is RHEL 8 and later. pip does not
 # expand a PEP 600 tag to the older ones, so linux_platforms() lists them all.
 MANYLINUX = os.environ.get("MANYLINUX", "2_28")
-DIST_SUFFIXES = (".whl", ".tar.gz", ".zip")
 
 
 class MirrorError(Exception):
@@ -95,9 +93,15 @@ class Target:
         return linux_platforms(MANYLINUX, self.arch)
 
     def files(self) -> List[Path]:
+        """The wheels in this target's wheelhouse. Nothing else is ever published."""
         if not self.wheelhouse.is_dir():
             return []
-        return sorted(p for p in self.wheelhouse.iterdir() if p.name.endswith(DIST_SUFFIXES))
+        return sorted(p for p in self.wheelhouse.iterdir() if p.name.endswith(".whl"))
+
+    def non_wheels(self) -> List[Path]:
+        if not self.wheelhouse.is_dir():
+            return []
+        return sorted(p for p in self.wheelhouse.iterdir() if p.is_file() and not p.name.endswith(".whl"))
 
 
 def linux_platforms(glibc: str, arch: str) -> List[str]:
@@ -138,47 +142,20 @@ def normalize(name: str) -> str:
 
 
 def name_and_version(filename: str) -> tuple:
-    if filename.endswith(".whl"):
-        parts = filename[: -len(".whl")].split("-")
-        if len(parts) not in (5, 6):
-            raise MirrorError(f"{filename}: not a wheel file name")
-        return parts[0], parts[1]
-    for suffix in (".tar.gz", ".zip"):
-        if filename.endswith(suffix):
-            stem = filename[: -len(suffix)]
-            if "-" not in stem:
-                raise MirrorError(f"{filename}: not an sdist file name")
-            name, version = stem.rsplit("-", 1)
-            return name, version
-    raise MirrorError(f"{filename}: not a wheel or sdist")
+    parts = filename[: -len(".whl")].split("-") if filename.endswith(".whl") else []
+    if len(parts) not in (5, 6):
+        raise MirrorError(f"{filename}: not a wheel file name")
+    return parts[0], parts[1]
 
 
 def read_metadata(path: Path) -> Dict[str, str]:
-    """The core metadata headers of a wheel or sdist, or {} when absent."""
-    raw = b""
+    """The core metadata headers of a wheel, or {} when it has none."""
     try:
-        if path.name.endswith(".whl"):
-            with zipfile.ZipFile(path) as archive:
-                member = next(
-                    (n for n in archive.namelist() if n.endswith(".dist-info/METADATA")), None
-                )
-                raw = archive.read(member) if member else b""
-        elif path.name.endswith(".tar.gz"):
-            with tarfile.open(path) as archive:
-                member = next(
-                    (m for m in archive.getmembers() if m.name.count("/") == 1 and m.name.endswith("/PKG-INFO")),
-                    None,
-                )
-                handle = archive.extractfile(member) if member else None
-                raw = handle.read() if handle else b""
-        elif path.name.endswith(".zip"):
-            with zipfile.ZipFile(path) as archive:
-                member = next(
-                    (n for n in archive.namelist() if n.count("/") == 1 and n.endswith("/PKG-INFO")), None
-                )
-                raw = archive.read(member) if member else b""
-    except (zipfile.BadZipFile, tarfile.TarError) as error:
-        raise MirrorError(f"{path.name}: unreadable archive: {error}") from error
+        with zipfile.ZipFile(path) as archive:
+            member = next((n for n in archive.namelist() if n.endswith(".dist-info/METADATA")), None)
+            raw = archive.read(member) if member else b""
+    except zipfile.BadZipFile as error:
+        raise MirrorError(f"{path.name}: unreadable wheel: {error}") from error
     if not raw:
         return {}
     headers = email.parser.BytesHeaderParser().parsebytes(raw)
@@ -308,19 +285,15 @@ def pip_download(target: Target, extra: List[str]) -> None:
             "--disable-pip-version-check", "--progress-bar", "off", *extra]
     requirements = target.path / "requirements.txt"
     if requirements.is_file() and read_lines(requirements):
+        # Wheels only, for every package and every dependency. A source
+        # distribution needs a compiler and build dependencies on the
+        # air-gapped host; a package with no wheel for this target fails the
+        # download here instead of failing the install there.
         command = base + ["-r", str(requirements), "--only-binary=:all:",
                           "--python-version", target.python, "--implementation", "cp"]
         for platform in target.platforms:
             command += ["--platform", platform]
         print(f"==> {target.name}: {' '.join(command[3:])}", flush=True)
-        subprocess.run(command, check=True)
-    # Packages published only as source. pip will not resolve a foreign
-    # platform's dependencies for an sdist, so these come without dependencies:
-    # list those in requirements.txt (as wheels) or here.
-    sdists = target.path / "sdist.txt"
-    if sdists.is_file() and read_lines(sdists):
-        command = base + ["-r", str(sdists), "--no-deps", "--no-binary=:all:"]
-        print(f"==> {target.name} (sdist): {' '.join(command[3:])}", flush=True)
         subprocess.run(command, check=True)
 
 
@@ -342,6 +315,8 @@ def distinct_files(targets: Iterable[Target]) -> Dict[str, Path]:
     """One path per file name: the same wheel downloaded for two targets is one upload."""
     files: Dict[str, Path] = {}
     for target in targets:
+        for path in target.non_wheels():
+            print(f"WARNING: ignoring {path.relative_to(ROOT)}: only wheels are published", file=sys.stderr)
         for path in target.files():
             files.setdefault(path.name, path)
     return files
