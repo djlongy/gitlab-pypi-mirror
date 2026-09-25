@@ -65,6 +65,10 @@ ARCHES = {"linux": {"x86_64", "aarch64"}, "windows": {"amd64", "arm64", "win32"}
 # Newest glibc the Linux hosts have: 2_28 is RHEL 8 and later. pip does not
 # expand a PEP 600 tag to the older ones, so linux_platforms() lists them all.
 MANYLINUX = os.environ.get("MANYLINUX", "2_28")
+# What a bundle carries besides wheels. Git needs git in the job image and a full clone (GIT_DEPTH 0).
+BUNDLE_REQUIREMENTS = os.environ.get("BUNDLE_REQUIREMENTS", "true").lower() in ("1", "true", "yes")
+BUNDLE_GIT = os.environ.get("BUNDLE_GIT", "false").lower() in ("1", "true", "yes")
+LAST_BUNDLE = ".last-bundle"  # what the last bundle carried besides wheels, kept in the CI cache
 
 
 class MirrorError(Exception):
@@ -359,19 +363,47 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def write_bundle(files: List[Path], out_dir: Path, kind: str) -> Optional[Path]:
-    if not files:
-        print("bundle: nothing new, no bundle written")
-        return None
+def git(*args: str) -> str:
+    # safe.directory: in CI the checkout belongs to another uid than the job.
+    result = subprocess.run(["git", "-c", "safe.directory=*", "-C", str(ROOT), *args], capture_output=True, text=True)
+    if result.returncode:
+        raise MirrorError(f"git {args[0]}: {result.stderr.strip() or 'exit ' + str(result.returncode)}")
+    return result.stdout.strip()
+
+
+def extras() -> Tuple[List[Tuple[str, Path]], Optional[str]]:
+    """The requirement files and the commit a bundle carries, per BUNDLE_REQUIREMENTS and BUNDLE_GIT."""
+    definitions = [(f"{t.name}/{p.name}", p) for t in find_targets() for p in t.definition()] if BUNDLE_REQUIREMENTS else []
+    head = None
+    if BUNDLE_GIT:
+        if not shutil.which("git"):
+            raise MirrorError("BUNDLE_GIT is on and this job has no git: use an image with git, or turn BUNDLE_GIT off")
+        if git("rev-parse", "--is-shallow-repository") != "false":
+            raise MirrorError("BUNDLE_GIT is on and this is a shallow clone: set GIT_DEPTH to 0 for this job")
+        head = git("rev-parse", "HEAD")
+    return definitions, head
+
+
+def fingerprint(definitions: List[Tuple[str, Path]], head: Optional[str]) -> str:
+    return json.dumps([head] + [[name, sha256_file(p)] for name, p in definitions])
+
+
+def write_bundle(files: List[Path], out_dir: Path, kind: str,
+                 definitions: List[Tuple[str, Path]], head: Optional[str]) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    now = time.time()  # milliseconds keep two runs in one second apart, and the names sort in time order
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now)) + f"{int(now * 1000) % 1000:03d}Z"
     path = out_dir / f"pypi-{kind}-{stamp}.tar"
-    definitions = [(f"{t.name}/{p.name}", p) for t in find_targets() for p in t.definition()]
     manifest = {"created": stamp, "kind": kind, "source": os.environ.get("CI_PROJECT_PATH", ""),
-                "commit": os.environ.get("CI_COMMIT_SHA", ""),
+                "commit": os.environ.get("CI_COMMIT_SHA", "") or head or "",
                 "files": [{"file": f.name, "sha256": sha256_file(f), "size": f.stat().st_size}
                           for f in sorted(files, key=lambda f: f.name)],
                 "requirements": [{"file": name, "sha256": sha256_file(p)} for name, p in definitions]}
+    work = tempfile.TemporaryDirectory()
+    if head:
+        repo = Path(work.name) / "repo.bundle"
+        git("bundle", "create", str(repo), "HEAD")
+        manifest["git"] = {"file": "repo.bundle", "sha256": sha256_file(repo), "head": head}
     tmp = path.with_name("." + path.name + ".tmp")
     with tarfile.open(tmp, "w", format=tarfile.PAX_FORMAT) as tar:
         data = (json.dumps(manifest, indent=1) + "\n").encode()
@@ -382,10 +414,13 @@ def write_bundle(files: List[Path], out_dir: Path, kind: str) -> Optional[Path]:
             tar.add(f, arcname=f"wheels/{f.name}", recursive=False)
         for name, p in definitions:
             tar.add(p, arcname=f"requirements/{name}", recursive=False)
+        if head:
+            tar.add(repo, arcname="repo.bundle", recursive=False)
+    work.cleanup()
     os.replace(tmp, path)
     path.with_name(path.name + ".sha256").write_text(f"{sha256_file(path)}  {path.name}\n")
     total = sum(entry["size"] for entry in manifest["files"])
-    print(f"bundle: {path} ({len(files)} file(s), {total / 1e6:.1f} MB)")
+    print(f"bundle: {path} ({len(files)} file(s), {total / 1e6:.1f} MB{', git ' + head[:12] if head else ''})")
     return path
 
 
@@ -409,6 +444,8 @@ def read_bundle(path: Path, into: Path) -> List[Tuple[Path, str]]:
     for entry in manifest.get("requirements", []):
         if sha256_file(into / "requirements" / entry["file"]) != entry["sha256"]:
             raise MirrorError(f"{path.name}: requirements/{entry['file']} does not match its sha256")
+    if "git" in manifest and sha256_file(into / "repo.bundle") != manifest["git"]["sha256"]:
+        raise MirrorError(f"{path.name}: repo.bundle does not match its sha256")
     return out
 
 
@@ -478,7 +515,14 @@ def cmd_publish(args) -> int:
     verb = "to upload" if args.dry_run else "uploaded"
     print(f"{len(files)} file(s): {len(uploaded)} {verb}, {skipped} already in the registry")
     if args.bundle and not args.dry_run:
-        write_bundle(uploaded, Path(args.bundle), "delta")
+        definitions, head = extras()
+        state, marker = fingerprint(definitions, head), ROOT / LAST_BUNDLE
+        carries_extras = bool(definitions or head)
+        if uploaded or (carries_extras and (not marker.is_file() or marker.read_text() != state)):
+            write_bundle(uploaded, Path(args.bundle), "delta", definitions, head)
+            marker.write_text(state)
+        else:
+            print("bundle: nothing new, no bundle written")
     return 0
 
 
@@ -490,7 +534,7 @@ def cmd_export(args) -> int:
     print(f"{len(wanted)} file(s) received since {args.since}")
     with tempfile.TemporaryDirectory() as tmp:
         paths = [registry.download(f["file"], f["sha256"], Path(tmp)) for f in wanted]
-        write_bundle(paths, Path(args.bundle), f"since-{args.since}")
+        write_bundle(paths, Path(args.bundle), f"since-{args.since}", *extras())
     return 0
 
 
@@ -501,6 +545,9 @@ def cmd_import(args) -> int:
         for bundle in args.bundle:
             unpacked = Path(tmp) / Path(bundle).stem
             wheels = read_bundle(Path(bundle), unpacked)
+            if args.git_bundle and (unpacked / "repo.bundle").is_file():
+                shutil.copyfile(unpacked / "repo.bundle", args.git_bundle)
+                print(f"git history from {Path(bundle).name} written to {args.git_bundle}")
             if args.requirements and (unpacked / "requirements").is_dir():
                 # Later bundles overwrite earlier ones, so pass them oldest first.
                 shutil.copytree(unpacked / "requirements", args.requirements, dirs_exist_ok=True)
@@ -561,6 +608,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             command.add_argument("bundle", nargs="+", help="pypi-*.tar written by publish --bundle or export, oldest first")
             command.add_argument("--requirements", metavar="DIR",
                                  help="also write the bundled requirements.txt and platforms.txt to DIR/<target>/")
+            command.add_argument("--git-bundle", metavar="FILE", help="also write the bundled git history to FILE")
     args = parser.parse_args(argv)
     try:
         return args.handler(args)
