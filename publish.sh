@@ -56,6 +56,11 @@ for path in "$wheelhouse"/*; do
     *.whl) ;;
     *) echo "WARNING: ignoring wheelhouse/$file: only wheels are published" >&2; continue ;;
   esac
+  if head -c 40 "$path" | grep -q '^version https://git-lfs'; then
+    echo "ERROR: $file is a Git LFS pointer, not a wheel. Install git-lfs where this runs," >&2
+    echo "       or delete .gitattributes and commit the wheels as ordinary files." >&2
+    exit 1
+  fi
   total=$((total + 1))
 
   stem=${file%.whl}
