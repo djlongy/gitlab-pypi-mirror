@@ -108,8 +108,12 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
 
 Every file in `wheelhouse/` is in the project's package registry, and pip on
 an air-gapped host installs from the group index, which serves every project in the
-group. `$TOKEN` needs `read_api` on the group. Uploads always go to the project.
+group. With a public group and a public project, pip needs no token. The group is
+its id or its URL-encoded path. Uploads always go to the project.
 
 ```bash
-pip install --index-url "https://__token__:$TOKEN@gitlab.example.com/api/v4/groups/<group-id>/-/packages/pypi/simple" requests==2.32.5
+pip install --index-url "https://gitlab.example.com/api/v4/groups/<group>/-/packages/pypi/simple" requests==2.32.5
 ```
+
+For a private group, add `__token__:$TOKEN@` after `https://`, with a token that
+has `read_api` on the group.
