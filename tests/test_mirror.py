@@ -438,7 +438,15 @@ class BundleTests(FakeRegistry):
         with mock.patch("sys.stderr", err):
             code, _ = self.run_cli("export", "--since", "2026-09-15")
         self.assertEqual(code, 1)
-        self.assertIn("set PYPI_TOKEN (EXPORT_TOKEN in CI) to a project access token with read_api", err.getvalue())
+        self.assertIn("set PYPI_TOKEN holding a project access token", err.getvalue())
+
+    def test_export_in_ci_names_the_ci_variable(self):
+        os.environ["GITLAB_CI"] = "true"
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code, _ = self.run_cli("export", "--since", "2026-09-15")
+        self.assertEqual(code, 1)
+        self.assertIn("add a masked CI/CD variable EXPORT_TOKEN", err.getvalue())
 
     def test_export_rebuilds_a_bundle_of_files_received_since_a_date(self):
         os.environ["PYPI_TOKEN"], os.environ["PYPI_USERNAME"] = TOKEN, "gitlab-ci-token-as-pat"

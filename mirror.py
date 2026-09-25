@@ -283,8 +283,10 @@ class Registry:
         A version gains files over time (one wheel per platform), so the date is read per file.
         A CI job token cannot list packages, so this needs PYPI_TOKEN with read_api."""
         if self.job_token:
+            where = ("add a masked CI/CD variable EXPORT_TOKEN" if os.environ.get("GITLAB_CI")
+                     else "set PYPI_TOKEN")
             raise MirrorError("export lists packages through the packages API, which a CI job token cannot read: "
-                              "set PYPI_TOKEN (EXPORT_TOKEN in CI) to a project access token with read_api (Reporter role)")
+                              f"{where} holding a project access token with the Reporter role and read_api scope")
         found, page = [], 1
         while True:
             url = f"{self.project_api}/packages?package_type=pypi&per_page=100&page={page}"
