@@ -60,6 +60,8 @@ The full set is in the argument parser and `Registry.from_env` in `mirror.py`.
 | Optional | `MIRROR_SYNC` (CI) | unset | `true` on Run pipeline runs the scheduled `sync` job now |
 | Optional | `EXPORT_SINCE` (CI) | unset | `YYYY-MM-DD` on Run pipeline: bundle every file the registry received since then. Needs a masked CI variable: `EXPORT_TOKEN` (project access token, Reporter, `read_api`), or one `PYPI_TOKEN` (Developer, `api`) that every job then uses |
 | Optional | `BUNDLE_REQUIREMENTS` | `true` | Bundles carry each target's `requirements.txt` and `platforms.txt` |
+| Optional | `NIFI_URL` | unset | POST each new bundle here too, e.g. `https://nifi.example.com:9099/contentListener` |
+| When `NIFI_URL` is mutual TLS | `NIFI_CLIENT_CERT`, `NIFI_CLIENT_KEY` | unset | Client certificate and key files; `CA_BUNDLE` verifies the server |
 | Optional | `BUNDLE_GIT` | `false` | Bundles carry the repository's history as a git bundle. Needs git in `PYTHON_IMAGE` |
 
 ## Usage
@@ -107,6 +109,12 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
   the bundled target files to `DIR/<target>/` and `--git-bundle FILE` the history;
   pass bundles oldest first so the newest wins. After a missed or expired bundle, run
   the pipeline with `EXPORT_SINCE` and import the `export` job's bundle.
+- With `NIFI_URL` set, `sync` and `export` also POST each bundle, with `filename` and
+  `x-sha256` headers. A refused POST fails the job, keeps the artifact, and the next run
+  sends a new bundle. `nifi/flow.py --side low` builds `ListenHTTP` -> `PutFile` into the
+  diode; `--side high` builds `ListFile` -> `FetchFile` -> `PutFile` into an inbox. On the
+  high side, a timer runs `mirror.py import --inbox DIR`, which imports every bundle
+  there oldest first and moves each to `DIR/done/`.
 - To make a high-side clone of this repository match the low side, discarding any
   high-side commits: `git fetch FILE HEAD:refs/remotes/low/main`, then
   `git push --force origin refs/remotes/low/main:refs/heads/main`. The push needs force

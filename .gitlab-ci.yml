@@ -26,6 +26,8 @@ variables:
   # What sync and export bundles carry besides wheels. BUNDLE_GIT needs git in PYTHON_IMAGE.
   BUNDLE_REQUIREMENTS: "true"
   BUNDLE_GIT: "false"
+  # Set NIFI_URL (a NiFi ListenHTTP, http(s)://host:port/contentListener) to POST each
+  # bundle there as well; see nifi/flow.py. Unset, bundles stay artifacts only.
 
 default:
   image: $PYTHON_IMAGE
@@ -84,6 +86,7 @@ sync:
       - .last-bundle
   artifacts:
     name: pypi-delta-$CI_PIPELINE_ID
+    when: always  # a bundle NiFi refused is still downloadable
     paths:
       - delta/
     expire_in: 14 days
@@ -103,6 +106,7 @@ export:
     - python3 mirror.py export --since "$EXPORT_SINCE" --bundle bundle
   artifacts:
     name: pypi-since-$EXPORT_SINCE
+    when: always
     paths:
       - bundle/
     expire_in: 14 days
