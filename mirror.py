@@ -9,6 +9,11 @@ Two halves, one file, standard library only:
 
   In GitLab CI, where the runner cannot reach PyPI:
       mirror.py publish       upload every downloaded file the registry lacks
+                              (--bundle DIR: also tar just those files for the high side)
+
+  Moving packages across an air gap:
+      mirror.py export        tar every file the registry received since a date
+      mirror.py import        verify a tar and upload what the registry here lacks
 
 A target is a directory under packages/ named <os>-py<X.Y>[-<arch>]:
 
@@ -29,18 +34,23 @@ import base64
 import email.parser
 import hashlib
 import html
+import io
+import json
 import os
 import re
 import ssl
 import subprocess
 import sys
+import tarfile
+import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parent
 PACKAGES = ROOT / "packages"
@@ -175,8 +185,10 @@ class Registry:
 
     def __init__(self, api_url: str, project: str, username: str, token: str, ca_bundle: Optional[str]):
         project_ref = urllib.parse.quote(project, safe="") if not project.isdigit() else project
-        self.base = f"{api_url.rstrip('/')}/projects/{project_ref}/packages/pypi"
+        self.project_api = f"{api_url.rstrip('/')}/projects/{project_ref}"
+        self.base = f"{self.project_api}/packages/pypi"
         self.auth = "Basic " + base64.b64encode(f"{username}:{token}".encode()).decode()
+        self.token, self.job_token = token, username == "gitlab-ci-token"
         self.context = ssl.create_default_context(cafile=ca_bundle) if ca_bundle else None
         self._known: Dict[str, Set[str]] = {}
 
@@ -203,7 +215,11 @@ class Registry:
         return cls(api_url, project, username, token, env.get("CA_BUNDLE") or None)
 
     def _request(self, request: urllib.request.Request):
-        request.add_header("Authorization", self.auth)
+        # The package endpoints take Basic auth. The REST API ignores it and answers 404.
+        if request.full_url.startswith(self.base):
+            request.add_header("Authorization", self.auth)
+        else:
+            request.add_header("PRIVATE-TOKEN", self.token)
         opener = urllib.request.build_opener(
             urllib.request.HTTPSHandler(context=self.context), _NoRedirect()
         )
@@ -227,6 +243,42 @@ class Registry:
                 page = ""
             self._known[key] = {html.unescape(m) for m in re.findall(r">([^<>]+)</a>", page)}
         return self._known[key]
+
+    def _get(self, url: str) -> bytes:
+        try:
+            with self._request(urllib.request.Request(url)) as response:
+                return response.read()
+        except urllib.error.HTTPError as error:
+            raise MirrorError(f"GET {url}: HTTP {error.code}") from error
+
+    def files_since(self, since: str) -> List[Dict[str, str]]:
+        """Every PyPI file the registry received on or after `since` (YYYY-MM-DD), from the packages API.
+
+        A version gains files over time (one wheel per platform), so the date is read per file.
+        A CI job token cannot list packages, so this needs PYPI_TOKEN with read_api."""
+        if self.job_token:
+            raise MirrorError("export lists packages through the packages API, which a CI job token cannot read: "
+                              "set PYPI_TOKEN to a project access token with read_api (Reporter role)")
+        found, page = [], 1
+        while True:
+            url = f"{self.project_api}/packages?package_type=pypi&per_page=100&page={page}"
+            packages = json.loads(self._get(url))
+            for package in packages:
+                files_url = f"{self.project_api}/packages/{package['id']}/package_files?per_page=100"
+                for item in json.loads(self._get(files_url)):
+                    if item["created_at"][:10] >= since and item["file_name"].endswith(".whl"):
+                        found.append({"file": item["file_name"], "sha256": item["file_sha256"]})
+            if len(packages) < 100:
+                return sorted(found, key=lambda f: f["file"])
+            page += 1
+
+    def download(self, filename: str, sha256: str, dest: Path) -> Path:
+        path = dest / filename
+        data = self._get(f"{self.base}/files/{sha256}/{urllib.parse.quote(filename)}")
+        if hashlib.sha256(data).hexdigest() != sha256:
+            raise MirrorError(f"{filename}: sha256 mismatch after download")
+        path.write_bytes(data)
+        return path
 
     def upload(self, path: Path) -> None:
         name, version = name_and_version(path.name)
@@ -262,6 +314,66 @@ class Registry:
                 return  # uploaded by a concurrent run between our check and our upload
             raise MirrorError(f"upload {path.name}: HTTP {error.code}: {detail}") from error
         self._known.setdefault(normalize(name), set()).add(path.name)
+
+
+# --- bundles ------------------------------------------------------------------
+#
+# A bundle is one tar: wheels/<file> for each file plus MANIFEST.json listing every
+# file with its sha256, and a <bundle>.sha256 beside it. It carries only the files
+# named, so a scheduled run ships what changed instead of the whole collection.
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_bundle(files: List[Path], out_dir: Path, kind: str) -> Optional[Path]:
+    if not files:
+        print("bundle: nothing new, no bundle written")
+        return None
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    path = out_dir / f"pypi-{kind}-{stamp}.tar"
+    manifest = {"created": stamp, "kind": kind, "source": os.environ.get("CI_PROJECT_PATH", ""),
+                "files": [{"file": f.name, "sha256": sha256_file(f), "size": f.stat().st_size}
+                          for f in sorted(files, key=lambda f: f.name)]}
+    tmp = path.with_name("." + path.name + ".tmp")
+    with tarfile.open(tmp, "w", format=tarfile.PAX_FORMAT) as tar:
+        data = (json.dumps(manifest, indent=1) + "\n").encode()
+        info = tarfile.TarInfo("MANIFEST.json")
+        info.size, info.mtime = len(data), int(time.time())
+        tar.addfile(info, fileobj=io.BytesIO(data))
+        for f in sorted(files, key=lambda f: f.name):
+            tar.add(f, arcname=f"wheels/{f.name}", recursive=False)
+    os.replace(tmp, path)
+    path.with_name(path.name + ".sha256").write_text(f"{sha256_file(path)}  {path.name}\n")
+    total = sum(entry["size"] for entry in manifest["files"])
+    print(f"bundle: {path} ({len(files)} file(s), {total / 1e6:.1f} MB)")
+    return path
+
+
+def read_bundle(path: Path, into: Path) -> List[Tuple[Path, str]]:
+    """Verify a bundle and its checksum, unpack it, and return (wheel, sha256) pairs."""
+    sidecar = path.with_name(path.name + ".sha256")
+    if sidecar.is_file() and sidecar.read_text().split()[0] != sha256_file(path):
+        raise MirrorError(f"{path.name}: checksum does not match {sidecar.name}")
+    with tarfile.open(path) as tar:
+        for member in tar.getmembers():
+            if not (member.isfile() or member.isdir()) or member.name.startswith("/") or ".." in Path(member.name).parts:
+                raise MirrorError(f"{path.name}: refusing unsafe entry {member.name!r}")
+        tar.extractall(into)
+    manifest = json.loads((into / "MANIFEST.json").read_text())
+    out = []
+    for entry in manifest["files"]:
+        wheel = into / "wheels" / entry["file"]
+        if not wheel.is_file() or sha256_file(wheel) != entry["sha256"]:
+            raise MirrorError(f"{path.name}: {entry['file']} is missing or does not match its sha256")
+        out.append((wheel, entry["sha256"]))
+    return out
 
 
 # --- commands -----------------------------------------------------------------
@@ -325,7 +437,7 @@ def distinct_files(targets: Iterable[Target]) -> Dict[str, Path]:
 def cmd_publish(args) -> int:
     registry = Registry.from_env()
     files = distinct_files(find_targets(args.target))
-    uploaded = skipped = 0
+    uploaded, skipped = [], 0
     for filename, path in sorted(files.items()):
         name, _ = name_and_version(filename)
         if filename in registry.existing(name):
@@ -336,9 +448,44 @@ def cmd_publish(args) -> int:
         else:
             registry.upload(path)
             print(f"uploaded {filename}", flush=True)
-        uploaded += 1
+        uploaded.append(path)
     verb = "to upload" if args.dry_run else "uploaded"
-    print(f"{len(files)} file(s): {uploaded} {verb}, {skipped} already in the registry")
+    print(f"{len(files)} file(s): {len(uploaded)} {verb}, {skipped} already in the registry")
+    if args.bundle and not args.dry_run:
+        write_bundle(uploaded, Path(args.bundle), "delta")
+    return 0
+
+
+def cmd_export(args) -> int:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.since):
+        raise MirrorError(f"--since {args.since!r}: expected YYYY-MM-DD")
+    registry = Registry.from_env()
+    wanted = registry.files_since(args.since)
+    print(f"{len(wanted)} file(s) received since {args.since}")
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = [registry.download(f["file"], f["sha256"], Path(tmp)) for f in wanted]
+        write_bundle(paths, Path(args.bundle), f"since-{args.since}")
+    return 0
+
+
+def cmd_import(args) -> int:
+    registry = Registry.from_env()
+    uploaded = skipped = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        for bundle in args.bundle:
+            for wheel, _ in read_bundle(Path(bundle), Path(tmp) / Path(bundle).stem):
+                name, _ = name_and_version(wheel.name)
+                if wheel.name in registry.existing(name):
+                    skipped += 1
+                    continue
+                if args.dry_run:
+                    print(f"would upload {wheel.name}")
+                else:
+                    registry.upload(wheel)
+                    print(f"uploaded {wheel.name}", flush=True)
+                uploaded += 1
+    verb = "to upload" if args.dry_run else "uploaded"
+    print(f"{uploaded + skipped} file(s): {uploaded} {verb}, {skipped} already in the registry")
     return 0
 
 
@@ -363,14 +510,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         ("download", cmd_download, "pip download every target into its wheelhouse/"),
         ("publish", cmd_publish, "upload wheelhouse files the registry does not have"),
         ("prune", cmd_prune, "remove local copies of wheels the registry already has"),
+        ("export", cmd_export, "tar every file the registry received since a date"),
+        ("import", cmd_import, "verify bundles and upload what the registry lacks"),
     ):
         command = sub.add_parser(name, help=text)
-        command.add_argument("--target", action="append", help="limit to this target (repeatable)")
+        if name not in ("export", "import"):
+            command.add_argument("--target", action="append", help="limit to this target (repeatable)")
         command.set_defaults(handler=handler)
         if name == "download":
             command.add_argument("--pip-arg", action="append", help="extra argument for pip download (repeatable)")
-        if name == "publish":
+        if name in ("publish", "import"):
             command.add_argument("--dry-run", action="store_true", help="list what would be uploaded")
+        if name == "publish":
+            command.add_argument("--bundle", metavar="DIR", help="also write the files uploaded by this run to a tar in DIR")
+        if name == "export":
+            command.add_argument("--since", required=True, help="YYYY-MM-DD, first day to include")
+            command.add_argument("--bundle", metavar="DIR", default="bundle", help="directory for the tar (default: bundle)")
+        if name == "import":
+            command.add_argument("bundle", nargs="+", help="pypi-*.tar written by publish --bundle or export")
     args = parser.parse_args(argv)
     try:
         return args.handler(args)
