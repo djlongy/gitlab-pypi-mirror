@@ -1,6 +1,12 @@
 # Uploads packages/*/wheelhouse/* to this project's PyPI package registry,
 # skipping every file the registry already has.
 #
+# A pipeline schedule (or Run pipeline with MIRROR_SYNC=true) runs `sync`: it
+# downloads from PyPI inside the job, publishes, and keeps only the files this
+# run uploaded as a short-lived artifact for the high side. That job needs a
+# runner that reaches PyPI, directly or through HTTPS_PROXY. Run pipeline with
+# EXPORT_SINCE=YYYY-MM-DD rebuilds a bundle from the registry after a missed one.
+#
 # Runs on any executor: a docker runner uses PYTHON_IMAGE, a shell runner uses
 # the host. python3 (3.8+) runs mirror.py; without it, publish.sh does the same
 # upload with curl, unzip and sha256sum. No network access beyond this GitLab.
@@ -49,8 +55,43 @@ publish:
         sh publish.sh
       fi
   rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $MIRROR_SYNC == "true" || $EXPORT_SINCE
+      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
       changes:
         - packages/**/*
-    # Run pipeline / schedule / API on the default branch: re-check everything.
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(web|schedule|api)$/
+    # Run pipeline / API on the default branch: re-check everything.
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(web|api)$/
+
+# Scheduled mirror: download, publish, and bundle only what this run uploaded.
+sync:
+  stage: publish
+  resource_group: pypi-registry
+  script:
+    - python3 mirror.py download
+    - python3 mirror.py publish --bundle delta
+  # Keeps the wheelhouses between runs on the same runner, so pip only fetches new files.
+  cache:
+    key: pypi-wheelhouse
+    paths:
+      - packages/*/wheelhouse/
+  artifacts:
+    name: pypi-delta-$CI_PIPELINE_ID
+    paths:
+      - delta/
+    expire_in: 14 days
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && ($CI_PIPELINE_SOURCE == "schedule" || $MIRROR_SYNC == "true")
+
+# Recovery: every file the registry received since EXPORT_SINCE, in one bundle.
+export:
+  stage: publish
+  script:
+    - python3 mirror.py export --since "$EXPORT_SINCE" --bundle bundle
+  artifacts:
+    name: pypi-since-$EXPORT_SINCE
+    paths:
+      - bundle/
+    expire_in: 14 days
+  rules:
+    - if: $EXPORT_SINCE

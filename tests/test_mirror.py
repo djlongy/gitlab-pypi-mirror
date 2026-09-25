@@ -6,14 +6,17 @@ skip-existing logic is exercised end to end without a GitLab instance.
 
 import base64
 import io
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import unittest
+import urllib.parse
 import zipfile
 from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -38,14 +41,17 @@ class FakeGitLab(BaseHTTPRequestHandler):
         pass
 
     def _authorized(self):
-        expected = "Basic " + base64.b64encode(f"gitlab-ci-token:{TOKEN}".encode()).decode()
-        if self.headers.get("Authorization") != expected:
+        header = self.headers.get("Authorization", "")
+        password = base64.b64decode(header[6:]).decode().split(":", 1)[-1] if header.startswith("Basic ") else ""
+        if password != TOKEN:
             self.send_response(401)
             self.end_headers()
             return False
         return True
 
     def do_GET(self):
+        if "/packages?" in self.path or "/package_files" in self.path or "/packages/pypi/files/" in self.path:
+            return self._packages_api()
         if self.path.startswith("/upstream/"):
             links = "".join(f'<a href="x">{n}</a>' for n in UPSTREAM_FILES)
             self.send_response(200)
@@ -73,6 +79,33 @@ class FakeGitLab(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _packages_api(self):
+        """GET /packages, /packages/<id>/package_files and /packages/pypi/files/<sha>/<name>."""
+        if "/packages/pypi/files/" not in self.path and self.headers.get("PRIVATE-TOKEN") != TOKEN:
+            self.send_response(404)  # the REST API ignores Basic auth and hides the project
+            self.end_headers()
+            return
+        if "/packages/pypi/files/" in self.path and not self._authorized():
+            return
+        names = sorted(self.files)
+        if "/packages/pypi/files/" in self.path:
+            filename = urllib.parse.unquote(self.path.rsplit("/", 1)[1])
+            data = next((f["_data"] for b in self.files.values() for n, f in b.items() if n == filename), None)
+            self.send_response(200 if data is not None else 404)
+            self.end_headers()
+            self.wfile.write(data or b"")
+            return
+        if "/package_files" in self.path:
+            pid = int(re.search(r"/packages/(\d+)/package_files", self.path)[1])
+            body = [{"file_name": n, "file_sha256": f.get("sha256_digest", ""),
+                     "created_at": f.get("_created", "2026-09-01T00:00:00Z")}
+                    for n, f in self.files[names[pid]].items()]
+        else:
+            body = [{"id": i, "name": n} for i, n in enumerate(names)]
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+
     def do_POST(self):
         if not self._authorized():
             return
@@ -89,6 +122,7 @@ class FakeGitLab(BaseHTTPRequestHandler):
             value = value[: -len(b"\r\n")] if value.endswith(b"\r\n") else value
             if fname:
                 filename = fname[1].decode()
+                fields["_data"] = value
             else:
                 fields[name] = value.decode()
         key = mirror.normalize(fields["name"])
@@ -98,6 +132,7 @@ class FakeGitLab(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"message":"Validation failed: File name has already been taken"}')
             return
+        fields["_created"] = self.server.now if hasattr(self.server, "now") else "2026-09-01T00:00:00Z"
         bucket[filename] = fields
         self.send_response(201)
         self.end_headers()
@@ -299,6 +334,86 @@ class RegistryTests(FakeRegistry):
             with self.assertRaises(mirror.MirrorError) as caught:
                 mirror.Registry.from_env()
         self.assertIn("PYPI_TOKEN (or CI_JOB_TOKEN)", str(caught.exception))
+
+
+class BundleTests(FakeRegistry):
+    def run_cli(self, *argv):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = mirror.main(list(argv))
+        return code, out.getvalue()
+
+    def bundles(self, directory):
+        return sorted(Path(directory).glob("pypi-*.tar"))
+
+    def test_publish_bundles_only_what_it_uploaded(self):
+        wheelhouse = self.target("linux-py3.12")
+        make_wheel(wheelhouse, "idna-3.20-py3-none-any.whl")
+        FakeGitLab.files["idna"] = {"idna-3.20-py3-none-any.whl": {}}      # already mirrored and shipped
+        make_wheel(wheelhouse, "certifi-2026.7.22-py3-none-any.whl")        # new since the last run
+        out_dir = Path(self.tmp.name) / "delta"
+        code, out = self.run_cli("publish", "--bundle", str(out_dir))
+        self.assertEqual(code, 0, out)
+        [bundle] = self.bundles(out_dir)
+        with tarfile.open(bundle) as tar:
+            self.assertEqual(sorted(tar.getnames()), ["MANIFEST.json", "wheels/certifi-2026.7.22-py3-none-any.whl"])
+        sidecar = bundle.with_name(bundle.name + ".sha256").read_text().split()[0]
+        self.assertEqual(sidecar, mirror.sha256_file(bundle))
+        code, out = self.run_cli("publish", "--bundle", str(out_dir))   # nothing new: no second bundle
+        self.assertIn("no bundle written", out)
+        self.assertEqual(len(self.bundles(out_dir)), 1)
+
+    def test_import_uploads_a_bundle_into_an_empty_registry_once(self):
+        make_wheel(self.target("linux-py3.12"), "certifi-2026.7.22-py3-none-any.whl", ">=3.7")
+        out_dir = Path(self.tmp.name) / "delta"
+        self.run_cli("publish", "--bundle", str(out_dir))
+        FakeGitLab.files = {}                                            # the high side starts empty
+        [bundle] = self.bundles(out_dir)
+        code, out = self.run_cli("import", str(bundle))
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 file(s): 1 uploaded", out)
+        self.assertEqual(FakeGitLab.files["certifi"]["certifi-2026.7.22-py3-none-any.whl"]["requires_python"], ">=3.7")
+        code, out = self.run_cli("import", str(bundle))
+        self.assertIn("0 uploaded, 1 already in the registry", out)
+
+    def test_a_tampered_bundle_is_refused(self):
+        make_wheel(self.target("linux-py3.12"), "certifi-2026.7.22-py3-none-any.whl")
+        out_dir = Path(self.tmp.name) / "delta"
+        self.run_cli("publish", "--bundle", str(out_dir))
+        [bundle] = self.bundles(out_dir)
+        with open(bundle, "ab") as handle:
+            handle.write(b"x")
+        FakeGitLab.files = {}
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code, _ = self.run_cli("import", str(bundle))
+        self.assertEqual(code, 1)
+        self.assertIn("checksum does not match", err.getvalue())
+        self.assertEqual(FakeGitLab.files, {})
+
+    def test_export_names_the_token_it_needs_when_given_a_job_token(self):
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code, _ = self.run_cli("export", "--since", "2026-09-15")
+        self.assertEqual(code, 1)
+        self.assertIn("set PYPI_TOKEN to a project access token with read_api", err.getvalue())
+
+    def test_export_rebuilds_a_bundle_of_files_received_since_a_date(self):
+        os.environ["PYPI_TOKEN"], os.environ["PYPI_USERNAME"] = TOKEN, "gitlab-ci-token-as-pat"
+        wheelhouse = self.target("linux-py3.12")
+        self.server.now = "2026-09-01T10:00:00Z"
+        make_wheel(wheelhouse, "idna-3.20-py3-none-any.whl")
+        self.run_cli("publish")
+        self.server.now = "2026-09-20T10:00:00Z"
+        make_wheel(wheelhouse, "certifi-2026.7.22-py3-none-any.whl")
+        self.run_cli("publish")
+        out_dir = Path(self.tmp.name) / "export"
+        code, out = self.run_cli("export", "--since", "2026-09-15", "--bundle", str(out_dir))
+        self.assertEqual(code, 0, out)
+        [bundle] = self.bundles(out_dir)
+        with tarfile.open(bundle) as tar:
+            self.assertIn("wheels/certifi-2026.7.22-py3-none-any.whl", tar.getnames())
+            self.assertNotIn("wheels/idna-3.20-py3-none-any.whl", tar.getnames())
 
 
 if __name__ == "__main__":

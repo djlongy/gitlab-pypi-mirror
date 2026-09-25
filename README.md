@@ -9,7 +9,7 @@ Mirrors Python packages for chosen OS and Python versions into a GitLab PyPI pac
 - GitLab with the package registry and Git LFS enabled on this project.
 - A runner of any executor, with `python3` 3.8+ or with `curl`, `unzip` and
   `sha256sum` (any busybox image). Without Python the pipeline publishes with
-  `publish.sh`. The runner needs no internet access.
+  `publish.sh`. Only the scheduled `sync` job needs PyPI access, and Python with pip.
 
 ## Targets
 
@@ -49,6 +49,8 @@ The full set is in the argument parser and `Registry.from_env` in `mirror.py`.
 | With `--prune` | `PYPI_TOKEN` | `$CI_JOB_TOKEN` | Token with `read_api`; `write_registry` too to publish from outside CI |
 | Optional | `CA_BUNDLE` | system store | CA file for the GitLab API. Replaces the system store, so it holds the full chain |
 | Optional | `PYTHON_IMAGE` (CI) | `python:3.12-slim` | Job image with Python, or with curl, unzip and sha256sum; point it at your internal registry |
+| Optional | `MIRROR_SYNC` (CI) | unset | `true` on Run pipeline runs the scheduled `sync` job now |
+| Optional | `EXPORT_SINCE` (CI) | unset | `YYYY-MM-DD` on Run pipeline: bundle every file the registry received since then. Needs `PYPI_TOKEN` as a masked CI variable: a project access token, Reporter, `read_api` |
 
 ## Usage
 
@@ -81,6 +83,13 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
   pypi.org. Turn forwarding off so air-gapped clients fail fast instead of timing out.
 - Each upload carries the wheel's `Requires-Python`, so pip on 3.9 never picks a
   release that needs 3.10.
+- A pipeline schedule on the default branch runs `sync` instead of `publish`: it downloads
+  in the job, publishes, and writes only the files this run uploaded to
+  `delta/pypi-delta-<UTC>.tar` with a `.sha256`, kept as an artifact for 14 days. A run
+  that uploads nothing writes no bundle. Unpinned requirements pick up new releases.
+- On the high side, `python3 mirror.py import pypi-*.tar` checks the checksum and each
+  wheel's sha256, then uploads what that registry lacks. After a missed or expired
+  bundle, run the pipeline with `EXPORT_SINCE` and import the `export` job's bundle.
 
 ## Out of scope
 
