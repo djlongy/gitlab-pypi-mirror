@@ -107,6 +107,12 @@ class FakeGitLab(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(body).encode())
 
     def do_POST(self):
+        if self.path == "/contentListener":  # stands in for NiFi's ListenHTTP
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            self.server.posted.append((self.headers["filename"], self.headers["x-sha256"], body))
+            self.send_response(self.server.post_status)
+            self.end_headers()
+            return
         if not self._authorized():
             return
         length = int(self.headers["Content-Length"])
@@ -237,6 +243,7 @@ class FakeRegistry(Workspace):
         FakeGitLab.files = {}
         self.server = HTTPServer(("127.0.0.1", 0), FakeGitLab)
         self.server.forward = False
+        self.server.posted, self.server.post_status = [], 200
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -483,6 +490,42 @@ class BundleTests(FakeRegistry):
         git("fetch", "-q", str(repo), "HEAD:refs/heads/low-side", cwd=high)
         self.assertEqual(git("rev-parse", "low-side", cwd=high), git("rev-parse", "HEAD"))
         self.assertEqual(git("log", "--format=%s", "low-side", cwd=high).splitlines(), ["second", "first"])
+
+    def test_a_bundle_is_posted_whole_and_a_failed_post_is_retried_next_run(self):
+        make_wheel(self.target("linux-py3.12", "certifi\n"), "certifi-2026.7.22-py3-none-any.whl")
+        out_dir = Path(self.tmp.name) / "delta"
+        url = f"http://127.0.0.1:{self.server.server_port}/contentListener"
+        self.server.post_status = 503                                          # NiFi down
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code, _ = self.run_cli("publish", "--bundle", str(out_dir), "--post", url)
+        self.assertEqual(code, 1)
+        self.assertIn("HTTP 503", err.getvalue())
+        self.server.post_status = 200
+        code, out = self.run_cli("publish", "--bundle", str(out_dir), "--post", url)   # nothing new to upload
+        self.assertEqual(code, 0, out)
+        [bundle] = self.bundles(out_dir)[-1:]
+        name, sha256, body = self.server.posted[-1]
+        self.assertEqual((name, sha256, body), (bundle.name, mirror.sha256_file(bundle), bundle.read_bytes()))
+
+    def test_inbox_imports_oldest_first_and_moves_each_bundle_to_done(self):
+        make_wheel(self.target("linux-py3.12", "certifi\n"), "certifi-2026.7.22-py3-none-any.whl")
+        inbox = Path(self.tmp.name) / "inbox"
+        self.run_cli("publish", "--bundle", str(inbox))
+        (self.packages / "linux-py3.12" / "requirements.txt").write_text("certifi\nidna\n")
+        make_wheel(self.packages.parent / "wheelhouse", "idna-3.20-py3-none-any.whl")
+        self.run_cli("publish", "--bundle", str(inbox))
+        FakeGitLab.files = {}
+        high = Path(self.tmp.name) / "high"
+        code, out = self.run_cli("import", "--inbox", str(inbox), "--requirements", str(high))
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 file(s): 2 uploaded", out)
+        self.assertEqual((high / "linux-py3.12" / "requirements.txt").read_text(), "certifi\nidna\n")  # newest won
+        self.assertEqual(list(inbox.glob("pypi-*")), [])
+        self.assertEqual(len(list((inbox / "done").glob("pypi-*.tar"))), 2)
+        code, out = self.run_cli("import", "--inbox", str(inbox))                    # empty inbox is not an error
+        self.assertEqual(code, 0, out)
+        self.assertIn("0 file(s)", out)
 
     def test_export_names_the_token_it_needs_when_given_a_job_token(self):
         err = io.StringIO()

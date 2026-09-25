@@ -424,6 +424,28 @@ def write_bundle(files: List[Path], out_dir: Path, kind: str,
     return path
 
 
+def post_bundle(path: Path, url: str) -> None:
+    """POST a bundle to NiFi's ListenHTTP, or anything else that takes a file in a POST body.
+
+    The name and sha256 go as headers: ListenHTTP turns them into flowfile attributes when
+    its "HTTP Headers to receive as Attributes (Regex)" matches them."""
+    context = ssl.create_default_context(cafile=os.environ.get("CA_BUNDLE") or None)
+    if os.environ.get("NIFI_CLIENT_CERT"):
+        context.load_cert_chain(os.environ["NIFI_CLIENT_CERT"], os.environ.get("NIFI_CLIENT_KEY") or None)
+    headers = {"Content-Type": "application/x-tar", "Content-Length": str(path.stat().st_size),
+               "filename": path.name, "x-sha256": sha256_file(path)}
+    with open(path, "rb") as body:
+        request = urllib.request.Request(url, data=body, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=600, context=context):
+                pass
+        except urllib.error.HTTPError as error:
+            raise MirrorError(f"POST {path.name} to {url}: HTTP {error.code}") from error
+        except (urllib.error.URLError, OSError) as error:
+            raise MirrorError(f"POST {path.name} to {url}: {getattr(error, 'reason', error)}") from error
+    print(f"posted {path.name} to {url}")
+
+
 def read_bundle(path: Path, into: Path) -> List[Tuple[Path, str]]:
     """Verify a bundle and its checksum, unpack it, and return (wheel, sha256) pairs."""
     sidecar = path.with_name(path.name + ".sha256")
@@ -519,8 +541,10 @@ def cmd_publish(args) -> int:
         state, marker = fingerprint(definitions, head), ROOT / LAST_BUNDLE
         carries_extras = bool(definitions or head)
         if uploaded or (carries_extras and (not marker.is_file() or marker.read_text() != state)):
-            write_bundle(uploaded, Path(args.bundle), "delta", definitions, head)
-            marker.write_text(state)
+            bundle = write_bundle(uploaded, Path(args.bundle), "delta", definitions, head)
+            if args.post:
+                post_bundle(bundle, args.post)
+            marker.write_text(state)  # after the POST, so a failed one is retried by the next run
         else:
             print("bundle: nothing new, no bundle written")
     return 0
@@ -534,15 +558,23 @@ def cmd_export(args) -> int:
     print(f"{len(wanted)} file(s) received since {args.since}")
     with tempfile.TemporaryDirectory() as tmp:
         paths = [registry.download(f["file"], f["sha256"], Path(tmp)) for f in wanted]
-        write_bundle(paths, Path(args.bundle), f"since-{args.since}", *extras())
+        bundle = write_bundle(paths, Path(args.bundle), f"since-{args.since}", *extras())
+    if args.post:
+        post_bundle(bundle, args.post)
     return 0
 
 
 def cmd_import(args) -> int:
     registry = Registry.from_env()
     uploaded = skipped = 0
+    bundles = [Path(b) for b in args.bundle]
+    if args.inbox:
+        # Oldest first by the time in the name, whatever the kind, so the newest requirements win.
+        bundles += sorted(Path(args.inbox).glob("pypi-*.tar"), key=lambda p: p.name.rsplit("-", 1)[-1])
+    elif not bundles:
+        raise MirrorError("name at least one bundle, or --inbox DIR")
     with tempfile.TemporaryDirectory() as tmp:
-        for bundle in args.bundle:
+        for bundle in bundles:
             unpacked = Path(tmp) / Path(bundle).stem
             wheels = read_bundle(Path(bundle), unpacked)
             if args.git_bundle and (unpacked / "repo.bundle").is_file():
@@ -563,6 +595,12 @@ def cmd_import(args) -> int:
                     registry.upload(wheel)
                     print(f"uploaded {wheel.name}", flush=True)
                 uploaded += 1
+            if args.inbox and not args.dry_run and bundle.parent == Path(args.inbox):
+                done = bundle.parent / "done"
+                done.mkdir(exist_ok=True)
+                for path in (bundle, bundle.with_name(bundle.name + ".sha256")):
+                    if path.exists():
+                        path.replace(done / path.name)
     verb = "to upload" if args.dry_run else "uploaded"
     print(f"{uploaded + skipped} file(s): {uploaded} {verb}, {skipped} already in the registry")
     return 0
@@ -601,11 +639,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             command.add_argument("--dry-run", action="store_true", help="list what would be uploaded")
         if name == "publish":
             command.add_argument("--bundle", metavar="DIR", help="also write the files uploaded by this run to a tar in DIR")
+        if name in ("publish", "export"):
+            command.add_argument("--post", metavar="URL", default=os.environ.get("NIFI_URL") or None,
+                                 help="also POST each bundle to URL, such as a NiFi ListenHTTP (default: $NIFI_URL)")
         if name == "export":
             command.add_argument("--since", required=True, help="YYYY-MM-DD, first day to include")
             command.add_argument("--bundle", metavar="DIR", default="bundle", help="directory for the tar (default: bundle)")
         if name == "import":
-            command.add_argument("bundle", nargs="+", help="pypi-*.tar written by publish --bundle or export, oldest first")
+            command.add_argument("bundle", nargs="*", help="pypi-*.tar written by publish --bundle or export, oldest first")
+            command.add_argument("--inbox", metavar="DIR",
+                                 help="also import every pypi-*.tar in DIR, oldest first, then move each to DIR/done/")
             command.add_argument("--requirements", metavar="DIR",
                                  help="also write the bundled requirements.txt and platforms.txt to DIR/<target>/")
             command.add_argument("--git-bundle", metavar="FILE", help="also write the bundled git history to FILE")
