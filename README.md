@@ -58,7 +58,9 @@ The full set is in the argument parser and `Registry.from_env` in `mirror.py`.
 | Optional | `CA_BUNDLE` | system store | CA file for the GitLab API. Replaces the system store, so it holds the full chain |
 | Optional | `PYTHON_IMAGE` (CI) | `python:3.12-slim` | Job image with Python, or with curl, unzip and sha256sum; point it at your internal registry |
 | Optional | `MIRROR_SYNC` (CI) | unset | `true` on Run pipeline runs the scheduled `sync` job now |
-| Optional | `EXPORT_SINCE` (CI) | unset | `YYYY-MM-DD` on Run pipeline: bundle every file the registry received since then. Needs a masked CI variable `EXPORT_TOKEN`: a project access token, Reporter, `read_api` |
+| Optional | `EXPORT_SINCE` (CI) | unset | `YYYY-MM-DD` on Run pipeline: bundle every file the registry received since then. Needs a masked CI variable: `EXPORT_TOKEN` (project access token, Reporter, `read_api`), or one `PYPI_TOKEN` (Developer, `api`) that every job then uses |
+| Optional | `BUNDLE_REQUIREMENTS` | `true` | Bundles carry each target's `requirements.txt` and `platforms.txt` |
+| Optional | `BUNDLE_GIT` | `false` | Bundles carry the repository's history as a git bundle. Needs git in `PYTHON_IMAGE` |
 
 ## Usage
 
@@ -93,15 +95,22 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
   release that needs 3.10.
 - A pipeline schedule on the default branch runs `sync` instead of `publish`: it downloads
   in the job, publishes, and writes only the files this run uploaded to
-  `delta/pypi-delta-<UTC>.tar` with a `.sha256`, kept as an artifact for 14 days. The
-  tar also holds every target's `requirements.txt` and `platforms.txt` under
-  `requirements/<target>/`, and `MANIFEST.json` names the commit. A run that uploads
-  nothing writes no bundle. Unpinned requirements pick up new releases.
+  `delta/pypi-delta-<UTC>.tar` with a `.sha256`, kept as an artifact for 14 days.
+  Unpinned requirements pick up new releases. `MANIFEST.json` names the commit. With
+  `BUNDLE_REQUIREMENTS` the tar holds `requirements/<target>/`, and with `BUNDLE_GIT`
+  it holds `repo.bundle`, the full history. Git LFS files are not in it, so GitLab refuses
+  a push of a history that holds any ("LFS objects are missing"). A run writes
+  no bundle when it uploads nothing and those files and the commit match the last
+  bundle this runner's cache remembers.
 - On the high side, `python3 mirror.py import pypi-*.tar` checks the checksum and each
-  wheel's sha256, then uploads what that registry lacks. `--requirements DIR` also
-  writes the bundled target files to `DIR/<target>/`; pass bundles oldest first so the
-  newest wins. After a missed or expired
-  bundle, run the pipeline with `EXPORT_SINCE` and import the `export` job's bundle.
+  wheel's sha256, then uploads what that registry lacks. `--requirements DIR` writes
+  the bundled target files to `DIR/<target>/` and `--git-bundle FILE` the history;
+  pass bundles oldest first so the newest wins. After a missed or expired bundle, run
+  the pipeline with `EXPORT_SINCE` and import the `export` job's bundle.
+- To make a high-side clone of this repository match the low side, discarding any
+  high-side commits: `git fetch FILE HEAD:refs/remotes/low/main`, then
+  `git push --force origin refs/remotes/low/main:refs/heads/main`. The push needs force
+  push allowed on the protected `main`.
 
 ## Out of scope
 

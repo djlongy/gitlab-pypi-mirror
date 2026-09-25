@@ -155,7 +155,9 @@ class Workspace(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
-        patcher = mock.patch.multiple(mirror, ROOT=root, PACKAGES=root / "packages")
+        # The flags come from the environment at import; a pipeline variable must not leak in.
+        patcher = mock.patch.multiple(mirror, ROOT=root, PACKAGES=root / "packages",
+                                      BUNDLE_REQUIREMENTS=True, BUNDLE_GIT=False)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.addCleanup(self.tmp.cleanup)
@@ -432,6 +434,55 @@ class BundleTests(FakeRegistry):
         self.assertEqual(code, 1)
         self.assertIn("checksum does not match", err.getvalue())
         self.assertEqual(FakeGitLab.files, {})
+
+    def test_a_requirements_change_alone_ships_a_bundle(self):
+        make_wheel(self.target("linux-py3.12", "certifi\n"), "certifi-2026.7.22-py3-none-any.whl")
+        out_dir = Path(self.tmp.name) / "delta"
+        self.run_cli("publish", "--bundle", str(out_dir))
+        (self.packages / "linux-py3.12" / "requirements.txt").write_text("")    # a package dropped, nothing new
+        code, out = self.run_cli("publish", "--bundle", str(out_dir))
+        self.assertEqual(code, 0, out)
+        self.assertIn("(0 file(s)", out)
+        self.assertEqual(len(self.bundles(out_dir)), 2)
+
+    def test_with_every_extra_off_a_run_with_nothing_new_writes_nothing(self):
+        self.target("linux-py3.12", "certifi\n")
+        out_dir = Path(self.tmp.name) / "delta"
+        with mock.patch.object(mirror, "BUNDLE_REQUIREMENTS", False):
+            code, out = self.run_cli("publish", "--bundle", str(out_dir))
+        self.assertIn("no bundle written", out)
+        self.assertEqual(self.bundles(out_dir), [])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_git_history_travels_in_the_bundle_and_fetches_on_the_high_side(self):
+        root = self.packages.parent
+        make_wheel(self.target("linux-py3.12", "certifi\n"), "certifi-2026.7.22-py3-none-any.whl")
+
+        def git(*args, cwd=root):
+            return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+                                  cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+        git("init", "-q")
+        git("add", "packages")
+        git("commit", "-qm", "first")
+        out_dir = Path(self.tmp.name) / "delta"
+        with mock.patch.object(mirror, "BUNDLE_GIT", True):
+            self.run_cli("publish", "--bundle", str(out_dir))
+            code, out = self.run_cli("publish", "--bundle", str(out_dir))       # same commit: nothing new
+            self.assertIn("no bundle written", out)
+            git("commit", "-q", "--allow-empty", "-m", "second")
+            code, out = self.run_cli("publish", "--bundle", str(out_dir))       # new commit, no new wheels
+        self.assertEqual(code, 0, out)
+        first, second = self.bundles(out_dir)
+        FakeGitLab.files = {}
+        repo = Path(self.tmp.name) / "repo.bundle"
+        code, out = self.run_cli("import", str(first), str(second), "--git-bundle", str(repo))
+        self.assertEqual(code, 0, out)
+        high = Path(self.tmp.name) / "high"
+        high.mkdir()
+        git("init", "-q", cwd=high)
+        git("fetch", "-q", str(repo), "HEAD:refs/heads/low-side", cwd=high)
+        self.assertEqual(git("rev-parse", "low-side", cwd=high), git("rev-parse", "HEAD"))
+        self.assertEqual(git("log", "--format=%s", "low-side", cwd=high).splitlines(), ["second", "first"])
 
     def test_export_names_the_token_it_needs_when_given_a_job_token(self):
         err = io.StringIO()

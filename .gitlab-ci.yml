@@ -23,6 +23,9 @@ variables:
   # your internal registry.
   PYTHON_IMAGE: python:3.12-slim
   GIT_DEPTH: "1"
+  # What sync and export bundles carry besides wheels. BUNDLE_GIT needs git in PYTHON_IMAGE.
+  BUNDLE_REQUIREMENTS: "true"
+  BUNDLE_GIT: "false"
 
 default:
   image: $PYTHON_IMAGE
@@ -68,6 +71,8 @@ publish:
 sync:
   stage: publish
   resource_group: pypi-registry
+  variables:
+    GIT_DEPTH: "0"  # BUNDLE_GIT bundles the full history
   script:
     - python3 mirror.py download
     - python3 mirror.py publish --bundle delta
@@ -76,6 +81,7 @@ sync:
     key: pypi-wheelhouse
     paths:
       - wheelhouse/
+      - .last-bundle
   artifacts:
     name: pypi-delta-$CI_PIPELINE_ID
     paths:
@@ -87,10 +93,12 @@ sync:
 # Recovery: every file the registry received since EXPORT_SINCE, in one bundle.
 export:
   stage: publish
-  # Only export reads the packages API, which the job token cannot. A PYPI_TOKEN
-  # CI variable would replace the job token for every upload, so this has its own.
+  # Only export reads the packages API, which the job token cannot. EXPORT_TOKEN
+  # (Reporter, read_api) is for this job alone. A project PYPI_TOKEN variable
+  # (Developer, api) serves every job instead and takes precedence over this line.
   variables:
     PYPI_TOKEN: $EXPORT_TOKEN
+    GIT_DEPTH: "0"
   script:
     - python3 mirror.py export --since "$EXPORT_SINCE" --bundle bundle
   artifacts:
