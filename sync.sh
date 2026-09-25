@@ -5,7 +5,7 @@
 # Run on the machine that can reach PyPI (directly or through HTTPS_PROXY).
 #
 #   ./sync.sh                         all targets, commit and push
-#   ./sync.sh --target linux-py3.12   one target (repeatable)
+#   ./sync.sh --target linux-py3.12   download one target only (repeatable)
 #   ./sync.sh --no-push               download and commit only
 #   ./sync.sh --prune                 also remove the repository's copy of every
 #                                     wheel the registry already holds
@@ -46,10 +46,10 @@ git pull --rebase --autostash
 "$PYTHON" mirror.py download ${args[@]+"${args[@]}"}
 
 if [ "$prune" = 1 ]; then
-  "$PYTHON" mirror.py prune ${args[@]+"${args[@]}"}
+  "$PYTHON" mirror.py prune
 fi
 
-git add --all packages
+git add --all packages wheelhouse
 if git diff --cached --quiet; then
   echo "nothing new to commit"
   exit 0

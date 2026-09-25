@@ -1,4 +1,4 @@
-# Uploads packages/*/wheelhouse/* to this project's PyPI package registry,
+# Uploads wheelhouse/* to this project's PyPI package registry,
 # skipping every file the registry already has.
 #
 # A pipeline schedule (or Run pipeline with MIRROR_SYNC=true) runs `sync`: it
@@ -60,6 +60,7 @@ publish:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
       changes:
         - packages/**/*
+        - wheelhouse/**/*
     # Run pipeline / API on the default branch: re-check everything.
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(web|api)$/
 
@@ -70,11 +71,11 @@ sync:
   script:
     - python3 mirror.py download
     - python3 mirror.py publish --bundle delta
-  # Keeps the wheelhouses between runs on the same runner, so pip only fetches new files.
+  # Keeps the wheelhouse between runs on the same runner, so pip only fetches new files.
   cache:
     key: pypi-wheelhouse
     paths:
-      - packages/*/wheelhouse/
+      - wheelhouse/
   artifacts:
     name: pypi-delta-$CI_PIPELINE_ID
     paths:
@@ -86,6 +87,10 @@ sync:
 # Recovery: every file the registry received since EXPORT_SINCE, in one bundle.
 export:
   stage: publish
+  # Only export reads the packages API, which the job token cannot. A PYPI_TOKEN
+  # CI variable would replace the job token for every upload, so this has its own.
+  variables:
+    PYPI_TOKEN: $EXPORT_TOKEN
   script:
     - python3 mirror.py export --since "$EXPORT_SINCE" --bundle bundle
   artifacts:
