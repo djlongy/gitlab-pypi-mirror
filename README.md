@@ -5,8 +5,13 @@ Mirrors Python packages for chosen OS and Python versions into a GitLab PyPI pac
 ## Requirements
 
 - A download machine that reaches PyPI directly or through an HTTP proxy, with
-  Python 3.8+, pip, git and git-lfs.
-- GitLab with the package registry and Git LFS enabled on this project.
+  Python 3.8+, pip and git. `sync.sh` also needs git-lfs while `.gitattributes`
+  sends wheels to Git LFS.
+- GitLab with the package registry enabled on this project, and Git LFS while
+  `.gitattributes` is present.
+- The scheduled `sync` job commits nothing and needs no git-lfs. A runner without
+  git-lfs checks committed wheels out as pointer files, which `publish` refuses: for
+  that runner, delete `.gitattributes` and commit wheels as ordinary files.
 - A runner of any executor, with `python3` 3.8+ or with `curl`, `unzip` and
   `sha256sum` (any busybox image). Without Python the pipeline publishes with
   `publish.sh`. Only the scheduled `sync` job needs PyPI access, and Python with pip.

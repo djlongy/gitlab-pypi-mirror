@@ -186,6 +186,11 @@ def read_metadata(path: Path) -> Dict[str, str]:
             member = next((n for n in archive.namelist() if n.endswith(".dist-info/METADATA")), None)
             raw = archive.read(member) if member else b""
     except zipfile.BadZipFile as error:
+        with open(path, "rb") as handle:
+            if handle.read(40).startswith(b"version https://git-lfs"):
+                raise MirrorError(f"{path.name}: a Git LFS pointer, not a wheel. This checkout has no git-lfs: "
+                                  "install it where this runs, or delete .gitattributes and commit the wheels as "
+                                  "ordinary files") from error
         raise MirrorError(f"{path.name}: unreadable wheel: {error}") from error
     if not raw:
         return {}

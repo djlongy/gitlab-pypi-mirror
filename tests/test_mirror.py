@@ -304,6 +304,17 @@ class RegistryTests(FakeRegistry):
         self.assertNotIn("pkg", FakeGitLab.files)
         self.assertIn("ignoring wheelhouse/pkg-0.1.tar.gz", err.getvalue())
 
+    def test_a_git_lfs_pointer_is_named_as_one(self):
+        """A runner without git-lfs checks out pointer files under the wheels' names."""
+        (self.target("linux-py3.12") / "idna-3.20-py3-none-any.whl").write_text(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:" + "0" * 64 + "\nsize 70000\n")
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code, _ = self.run_cli("publish")
+        self.assertEqual(code, 1)
+        self.assertIn("a Git LFS pointer, not a wheel", err.getvalue())
+        self.assertEqual(FakeGitLab.files, {})
+
     def test_dry_run_uploads_nothing(self):
         make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")
         code, out = self.run_cli("publish", "--dry-run")
@@ -497,6 +508,14 @@ class ShellPublishTests(FakeRegistry):
         self.assertEqual(code, 0, err)
         self.assertIn("0 file(s)", out)
         self.assertIn("ignoring wheelhouse/pkg-0.1.tar.gz", err)
+
+    def test_a_git_lfs_pointer_is_never_uploaded(self):
+        (self.target("linux-py3.12") / "idna-3.20-py3-none-any.whl").write_text(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:" + "0" * 64 + "\nsize 70000\n")
+        code, out, err = self.run_sh()
+        self.assertEqual(code, 1)
+        self.assertIn("is a Git LFS pointer", err)
+        self.assertEqual(FakeGitLab.files, {})
 
     def test_dry_run_uploads_nothing(self):
         make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")
