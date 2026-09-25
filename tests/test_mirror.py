@@ -162,9 +162,12 @@ class Workspace(unittest.TestCase):
         self.packages = root / "packages"
         self.packages.mkdir()
 
-    def target(self, name: str) -> Path:
-        path = self.packages / name / "wheelhouse"
-        path.mkdir(parents=True)
+    def target(self, name: str, requirements: str = "") -> Path:
+        """Create packages/<name>/ and return the shared wheelhouse every target downloads into."""
+        (self.packages / name).mkdir(exist_ok=True)
+        (self.packages / name / "requirements.txt").write_text(requirements)
+        path = self.packages.parent / "wheelhouse"
+        path.mkdir(exist_ok=True)
         return path
 
 
@@ -266,6 +269,7 @@ class RegistryTests(FakeRegistry):
         code, out = self.run_cli("publish")
         self.assertEqual(code, 0, out)
         self.assertIn("3 file(s): 2 uploaded, 1 already in the registry", out)
+        self.assertEqual(len(list(linux.iterdir())), 3)  # the shared wheel is on disk once
         uploaded = FakeGitLab.files["requests"]["requests-2.32.5-py3-none-any.whl"]
         self.assertEqual(uploaded["name"], "requests")
         self.assertEqual(uploaded["version"], "2.32.5")
@@ -298,7 +302,7 @@ class RegistryTests(FakeRegistry):
         self.assertEqual(code, 0, out)
         self.assertIn("1 file(s): 1 uploaded", out)
         self.assertNotIn("pkg", FakeGitLab.files)
-        self.assertIn("ignoring packages/linux-py3.12/wheelhouse/pkg-0.1.tar.gz", err.getvalue())
+        self.assertIn("ignoring wheelhouse/pkg-0.1.tar.gz", err.getvalue())
 
     def test_dry_run_uploads_nothing(self):
         make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")
@@ -312,6 +316,20 @@ class RegistryTests(FakeRegistry):
         registry = mirror.Registry.from_env()
         registry.upload(path)
         registry.upload(path)  # the registry answers 400 "already been taken"
+
+    def test_wheels_in_per_target_wheelhouses_move_into_the_shared_one_once(self):
+        for name in ("linux-py3.12", "windows-py3.12"):
+            self.target(name)
+            old = self.packages / name / "wheelhouse"
+            old.mkdir()
+            make_wheel(old, "requests-2.32.5-py3-none-any.whl")
+        make_wheel(self.packages / "windows-py3.12" / "wheelhouse", "pywin32-312-cp312-cp312-win_amd64.whl")
+        code, out = self.run_cli("publish")
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 file(s): 2 uploaded", out)
+        self.assertEqual(sorted(p.name for p in (self.packages.parent / "wheelhouse").iterdir()),
+                         ["pywin32-312-cp312-cp312-win_amd64.whl", "requests-2.32.5-py3-none-any.whl"])
+        self.assertEqual(list(self.packages.glob("*/wheelhouse")), [])
 
     def test_prune_deletes_only_published_files(self):
         wheelhouse = self.target("linux-py3.12")
@@ -356,7 +374,8 @@ class BundleTests(FakeRegistry):
         self.assertEqual(code, 0, out)
         [bundle] = self.bundles(out_dir)
         with tarfile.open(bundle) as tar:
-            self.assertEqual(sorted(tar.getnames()), ["MANIFEST.json", "wheels/certifi-2026.7.22-py3-none-any.whl"])
+            self.assertEqual(sorted(tar.getnames()), ["MANIFEST.json", "requirements/linux-py3.12/requirements.txt",
+                                                      "wheels/certifi-2026.7.22-py3-none-any.whl"])
         sidecar = bundle.with_name(bundle.name + ".sha256").read_text().split()[0]
         self.assertEqual(sidecar, mirror.sha256_file(bundle))
         code, out = self.run_cli("publish", "--bundle", str(out_dir))   # nothing new: no second bundle
@@ -364,7 +383,7 @@ class BundleTests(FakeRegistry):
         self.assertEqual(len(self.bundles(out_dir)), 1)
 
     def test_import_uploads_a_bundle_into_an_empty_registry_once(self):
-        make_wheel(self.target("linux-py3.12"), "certifi-2026.7.22-py3-none-any.whl", ">=3.7")
+        make_wheel(self.target("linux-py3.12", "certifi\n"), "certifi-2026.7.22-py3-none-any.whl", ">=3.7")
         out_dir = Path(self.tmp.name) / "delta"
         self.run_cli("publish", "--bundle", str(out_dir))
         FakeGitLab.files = {}                                            # the high side starts empty
@@ -375,6 +394,18 @@ class BundleTests(FakeRegistry):
         self.assertEqual(FakeGitLab.files["certifi"]["certifi-2026.7.22-py3-none-any.whl"]["requires_python"], ">=3.7")
         code, out = self.run_cli("import", str(bundle))
         self.assertIn("0 uploaded, 1 already in the registry", out)
+
+    def test_import_writes_the_requirements_that_came_with_the_bundle(self):
+        make_wheel(self.target("linux-py3.12", "certifi\n"), "certifi-2026.7.22-py3-none-any.whl")
+        (self.packages / "linux-py3.12" / "platforms.txt").write_text("manylinux_2_28_x86_64\n")
+        out_dir = Path(self.tmp.name) / "delta"
+        self.run_cli("publish", "--bundle", str(out_dir))
+        [bundle] = self.bundles(out_dir)
+        high = Path(self.tmp.name) / "high"
+        code, out = self.run_cli("import", str(bundle), "--requirements", str(high))
+        self.assertEqual(code, 0, out)
+        self.assertEqual((high / "linux-py3.12" / "requirements.txt").read_text(), "certifi\n")
+        self.assertEqual((high / "linux-py3.12" / "platforms.txt").read_text(), "manylinux_2_28_x86_64\n")
 
     def test_a_tampered_bundle_is_refused(self):
         make_wheel(self.target("linux-py3.12"), "certifi-2026.7.22-py3-none-any.whl")
@@ -396,7 +427,7 @@ class BundleTests(FakeRegistry):
         with mock.patch("sys.stderr", err):
             code, _ = self.run_cli("export", "--since", "2026-09-15")
         self.assertEqual(code, 1)
-        self.assertIn("set PYPI_TOKEN to a project access token with read_api", err.getvalue())
+        self.assertIn("set PYPI_TOKEN (EXPORT_TOKEN in CI) to a project access token with read_api", err.getvalue())
 
     def test_export_rebuilds_a_bundle_of_files_received_since_a_date(self):
         os.environ["PYPI_TOKEN"], os.environ["PYPI_USERNAME"] = TOKEN, "gitlab-ci-token-as-pat"
@@ -427,7 +458,7 @@ class ShellPublishTests(FakeRegistry):
     """publish.sh, the curl fallback, against the same fake registry."""
 
     def run_sh(self, *argv):
-        env = dict(os.environ, PACKAGES_DIR=str(self.packages), PATH=SHELL_PATH)
+        env = dict(os.environ, WHEELHOUSE_DIR=str(self.packages.parent / "wheelhouse"), PATH=SHELL_PATH)
         result = subprocess.run(
             ["sh", str(Path(mirror.__file__).with_name("publish.sh")), *argv],
             env=env, capture_output=True, text=True,
@@ -465,7 +496,7 @@ class ShellPublishTests(FakeRegistry):
         code, out, err = self.run_sh()
         self.assertEqual(code, 0, err)
         self.assertIn("0 file(s)", out)
-        self.assertIn("ignoring linux-py3.12/wheelhouse/pkg-0.1.tar.gz", err)
+        self.assertIn("ignoring wheelhouse/pkg-0.1.tar.gz", err)
 
     def test_dry_run_uploads_nothing(self):
         make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")

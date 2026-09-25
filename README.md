@@ -26,13 +26,16 @@ name is read.
 
 Only wheels are downloaded and published, for every package and every dependency.
 A package with no wheel for a target fails that target's download, and a non-wheel
-file in a `wheelhouse/` is ignored with a warning. Pin a release that has a wheel,
-or build one elsewhere and add it to the `wheelhouse/`.
+file in `wheelhouse/` is ignored with a warning. Pin a release that has a wheel,
+or build one elsewhere and add it to `wheelhouse/`.
 
 Optional in a target directory: `platforms.txt`, pip platform tags, one per line,
 replacing the defaults.
 
-Two targets that resolve the same file upload it once.
+Every target downloads into one `wheelhouse/` at the repository root. A wheel's file
+name carries its Python and platform tags, so a pure-Python wheel two targets need is
+stored, downloaded and uploaded once. Wheels in an older `packages/<target>/wheelhouse/`
+move there on the next `download` or `publish`.
 
 ## Environment
 
@@ -50,7 +53,7 @@ The full set is in the argument parser and `Registry.from_env` in `mirror.py`.
 | Optional | `CA_BUNDLE` | system store | CA file for the GitLab API. Replaces the system store, so it holds the full chain |
 | Optional | `PYTHON_IMAGE` (CI) | `python:3.12-slim` | Job image with Python, or with curl, unzip and sha256sum; point it at your internal registry |
 | Optional | `MIRROR_SYNC` (CI) | unset | `true` on Run pipeline runs the scheduled `sync` job now |
-| Optional | `EXPORT_SINCE` (CI) | unset | `YYYY-MM-DD` on Run pipeline: bundle every file the registry received since then. Needs `PYPI_TOKEN` as a masked CI variable: a project access token, Reporter, `read_api` |
+| Optional | `EXPORT_SINCE` (CI) | unset | `YYYY-MM-DD` on Run pipeline: bundle every file the registry received since then. Needs a masked CI variable `EXPORT_TOKEN`: a project access token, Reporter, `read_api` |
 
 ## Usage
 
@@ -67,14 +70,14 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
 
 ## Behaviour
 
-- `sync.sh` pulls, downloads every target into `packages/<target>/wheelhouse/`,
-  commits, and pushes. `--no-push` stops after the commit; `--target` limits the run.
+- `sync.sh` pulls, downloads every target into `wheelhouse/`, commits, and pushes.
+  `--no-push` stops after the commit; `--target` limits the download.
 - Every wheel stays in the repository, so it is also the archive the registry can
   be rebuilt from. A rerun downloads only files not already in `wheelhouse/`.
 - `sync.sh --prune` instead removes the repository's copy of each wheel the registry
   already holds, keeping the repository small. It needs `GITLAB_API_URL`,
   `PYPI_PROJECT` and `PYPI_TOKEN`, and never removes anything from the registry.
-- A push to the default branch that changes `packages/` runs `publish`, which asks
+- A push to the default branch that changes `packages/` or `wheelhouse/` runs `publish`, which asks
   the registry's simple index which files it holds and uploads only the rest.
   Running the pipeline from the web UI rechecks every file.
 - `publish` never follows a redirect when checking. With package forwarding on (the
@@ -85,10 +88,14 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
   release that needs 3.10.
 - A pipeline schedule on the default branch runs `sync` instead of `publish`: it downloads
   in the job, publishes, and writes only the files this run uploaded to
-  `delta/pypi-delta-<UTC>.tar` with a `.sha256`, kept as an artifact for 14 days. A run
-  that uploads nothing writes no bundle. Unpinned requirements pick up new releases.
+  `delta/pypi-delta-<UTC>.tar` with a `.sha256`, kept as an artifact for 14 days. The
+  tar also holds every target's `requirements.txt` and `platforms.txt` under
+  `requirements/<target>/`, and `MANIFEST.json` names the commit. A run that uploads
+  nothing writes no bundle. Unpinned requirements pick up new releases.
 - On the high side, `python3 mirror.py import pypi-*.tar` checks the checksum and each
-  wheel's sha256, then uploads what that registry lacks. After a missed or expired
+  wheel's sha256, then uploads what that registry lacks. `--requirements DIR` also
+  writes the bundled target files to `DIR/<target>/`; pass bundles oldest first so the
+  newest wins. After a missed or expired
   bundle, run the pipeline with `EXPORT_SINCE` and import the `export` job's bundle.
 
 ## Out of scope
@@ -99,7 +106,7 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
 
 ## Expected result
 
-Every file in every `wheelhouse/` is in the project's package registry, and pip on
+Every file in `wheelhouse/` is in the project's package registry, and pip on
 an air-gapped host installs from it:
 
 ```bash

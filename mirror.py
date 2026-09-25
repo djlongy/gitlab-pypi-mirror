@@ -21,7 +21,9 @@ A target is a directory under packages/ named <os>-py<X.Y>[-<arch>]:
   packages/windows-py3.9/requirements.txt
   packages/linux-py3.11-aarch64/requirements.txt
 
-Files land in packages/<target>/wheelhouse/. Run `mirror.py targets` to see how
+Every target downloads into one wheelhouse/ at the top of the repository. A
+wheel's file name carries its Python and platform tags, so targets never
+collide and a pure-Python wheel is stored once. Run `mirror.py targets` to see how
 each directory name is read.
 
 Python 3.8 or newer.
@@ -38,6 +40,7 @@ import io
 import json
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -50,7 +53,7 @@ import urllib.request
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parent
 PACKAGES = ROOT / "packages"
@@ -90,10 +93,6 @@ class Target:
             )
 
     @property
-    def wheelhouse(self) -> Path:
-        return self.path / WHEELHOUSE
-
-    @property
     def platforms(self) -> List[str]:
         override = self.path / "platforms.txt"
         if override.is_file():
@@ -102,16 +101,9 @@ class Target:
             return ["win32"] if self.arch == "win32" else [f"win_{self.arch}"]
         return linux_platforms(MANYLINUX, self.arch)
 
-    def files(self) -> List[Path]:
-        """The wheels in this target's wheelhouse. Nothing else is ever published."""
-        if not self.wheelhouse.is_dir():
-            return []
-        return sorted(p for p in self.wheelhouse.iterdir() if p.name.endswith(".whl"))
-
-    def non_wheels(self) -> List[Path]:
-        if not self.wheelhouse.is_dir():
-            return []
-        return sorted(p for p in self.wheelhouse.iterdir() if p.is_file() and not p.name.endswith(".whl"))
+    def definition(self) -> List[Path]:
+        """The files that say what this target needs: requirements.txt and platforms.txt."""
+        return [p for p in (self.path / "requirements.txt", self.path / "platforms.txt") if p.is_file()]
 
 
 def linux_platforms(glibc: str, arch: str) -> List[str]:
@@ -141,6 +133,35 @@ def find_targets(only: Optional[List[str]] = None) -> List[Target]:
             raise MirrorError(f"no such target: {', '.join(sorted(unknown))}")
         targets = [t for t in targets if t.name in only]
     return targets
+
+
+def wheelhouse() -> Path:
+    return ROOT / WHEELHOUSE
+
+
+def adopt_target_wheelhouses() -> None:
+    """Move packages/<target>/wheelhouse/ files into the shared wheelhouse, one copy per name."""
+    for old in sorted(PACKAGES.glob(f"*/{WHEELHOUSE}")):
+        wheelhouse().mkdir(exist_ok=True)
+        for path in old.iterdir():
+            if (wheelhouse() / path.name).exists():
+                path.unlink()  # a file name on PyPI never changes content
+            else:
+                path.replace(wheelhouse() / path.name)
+        old.rmdir()
+        print(f"moved {old.relative_to(ROOT)}/ into {WHEELHOUSE}/")
+
+
+def wheel_files() -> List[Path]:
+    """The wheels in the wheelhouse. Nothing else is ever published."""
+    adopt_target_wheelhouses()
+    if not wheelhouse().is_dir():
+        return []
+    files = sorted(p for p in wheelhouse().iterdir() if p.is_file())
+    for path in files:
+        if not path.name.endswith(".whl"):
+            print(f"WARNING: ignoring {path.relative_to(ROOT)}: only wheels are published", file=sys.stderr)
+    return [p for p in files if p.name.endswith(".whl")]
 
 
 # --- distribution files -------------------------------------------------------
@@ -258,7 +279,7 @@ class Registry:
         A CI job token cannot list packages, so this needs PYPI_TOKEN with read_api."""
         if self.job_token:
             raise MirrorError("export lists packages through the packages API, which a CI job token cannot read: "
-                              "set PYPI_TOKEN to a project access token with read_api (Reporter role)")
+                              "set PYPI_TOKEN (EXPORT_TOKEN in CI) to a project access token with read_api (Reporter role)")
         found, page = [], 1
         while True:
             url = f"{self.project_api}/packages?package_type=pypi&per_page=100&page={page}"
@@ -338,9 +359,12 @@ def write_bundle(files: List[Path], out_dir: Path, kind: str) -> Optional[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     path = out_dir / f"pypi-{kind}-{stamp}.tar"
+    definitions = [(f"{t.name}/{p.name}", p) for t in find_targets() for p in t.definition()]
     manifest = {"created": stamp, "kind": kind, "source": os.environ.get("CI_PROJECT_PATH", ""),
+                "commit": os.environ.get("CI_COMMIT_SHA", ""),
                 "files": [{"file": f.name, "sha256": sha256_file(f), "size": f.stat().st_size}
-                          for f in sorted(files, key=lambda f: f.name)]}
+                          for f in sorted(files, key=lambda f: f.name)],
+                "requirements": [{"file": name, "sha256": sha256_file(p)} for name, p in definitions]}
     tmp = path.with_name("." + path.name + ".tmp")
     with tarfile.open(tmp, "w", format=tarfile.PAX_FORMAT) as tar:
         data = (json.dumps(manifest, indent=1) + "\n").encode()
@@ -349,6 +373,8 @@ def write_bundle(files: List[Path], out_dir: Path, kind: str) -> Optional[Path]:
         tar.addfile(info, fileobj=io.BytesIO(data))
         for f in sorted(files, key=lambda f: f.name):
             tar.add(f, arcname=f"wheels/{f.name}", recursive=False)
+        for name, p in definitions:
+            tar.add(p, arcname=f"requirements/{name}", recursive=False)
     os.replace(tmp, path)
     path.with_name(path.name + ".sha256").write_text(f"{sha256_file(path)}  {path.name}\n")
     total = sum(entry["size"] for entry in manifest["files"])
@@ -373,6 +399,9 @@ def read_bundle(path: Path, into: Path) -> List[Tuple[Path, str]]:
         if not wheel.is_file() or sha256_file(wheel) != entry["sha256"]:
             raise MirrorError(f"{path.name}: {entry['file']} is missing or does not match its sha256")
         out.append((wheel, entry["sha256"]))
+    for entry in manifest.get("requirements", []):
+        if sha256_file(into / "requirements" / entry["file"]) != entry["sha256"]:
+            raise MirrorError(f"{path.name}: requirements/{entry['file']} does not match its sha256")
     return out
 
 
@@ -385,15 +414,14 @@ def cmd_targets(args) -> int:
         print(
             f"{target.name:28} python {target.python:5} {target.os:8} {target.arch:8} "
             f"platforms={target.platforms[0]}{f' (+{len(target.platforms) - 1} older)' if len(target.platforms) > 1 else ''} "
-            f"requirements={len(read_lines(requirements)) if requirements.is_file() else 0} "
-            f"downloaded={len(target.files())}"
+            f"requirements={len(read_lines(requirements)) if requirements.is_file() else 0}"
         )
     return 0
 
 
 def pip_download(target: Target, extra: List[str]) -> None:
-    target.wheelhouse.mkdir(exist_ok=True)
-    base = [sys.executable, "-m", "pip", "download", "--dest", str(target.wheelhouse),
+    wheelhouse().mkdir(exist_ok=True)
+    base = [sys.executable, "-m", "pip", "download", "--dest", str(wheelhouse()),
             "--disable-pip-version-check", "--progress-bar", "off", *extra]
     requirements = target.path / "requirements.txt"
     if requirements.is_file() and read_lines(requirements):
@@ -411,6 +439,7 @@ def pip_download(target: Target, extra: List[str]) -> None:
 
 def cmd_download(args) -> int:
     failed = []
+    adopt_target_wheelhouses()
     for target in find_targets(args.target):
         try:
             pip_download(target, args.pip_arg or [])
@@ -423,22 +452,12 @@ def cmd_download(args) -> int:
     return 0
 
 
-def distinct_files(targets: Iterable[Target]) -> Dict[str, Path]:
-    """One path per file name: the same wheel downloaded for two targets is one upload."""
-    files: Dict[str, Path] = {}
-    for target in targets:
-        for path in target.non_wheels():
-            print(f"WARNING: ignoring {path.relative_to(ROOT)}: only wheels are published", file=sys.stderr)
-        for path in target.files():
-            files.setdefault(path.name, path)
-    return files
-
-
 def cmd_publish(args) -> int:
     registry = Registry.from_env()
-    files = distinct_files(find_targets(args.target))
+    files = wheel_files()
     uploaded, skipped = [], 0
-    for filename, path in sorted(files.items()):
+    for path in files:
+        filename = path.name
         name, _ = name_and_version(filename)
         if filename in registry.existing(name):
             skipped += 1
@@ -473,7 +492,13 @@ def cmd_import(args) -> int:
     uploaded = skipped = 0
     with tempfile.TemporaryDirectory() as tmp:
         for bundle in args.bundle:
-            for wheel, _ in read_bundle(Path(bundle), Path(tmp) / Path(bundle).stem):
+            unpacked = Path(tmp) / Path(bundle).stem
+            wheels = read_bundle(Path(bundle), unpacked)
+            if args.requirements and (unpacked / "requirements").is_dir():
+                # Later bundles overwrite earlier ones, so pass them oldest first.
+                shutil.copytree(unpacked / "requirements", args.requirements, dirs_exist_ok=True)
+                print(f"requirements from {Path(bundle).name} written to {args.requirements}")
+            for wheel, _ in wheels:
                 name, _ = name_and_version(wheel.name)
                 if wheel.name in registry.existing(name):
                     skipped += 1
@@ -492,12 +517,11 @@ def cmd_import(args) -> int:
 def cmd_prune(args) -> int:
     registry = Registry.from_env()
     removed = 0
-    for target in find_targets(args.target):
-        for path in target.files():
-            name, _ = name_and_version(path.name)
-            if path.name in registry.existing(name):
-                path.unlink()
-                removed += 1
+    for path in wheel_files():
+        name, _ = name_and_version(path.name)
+        if path.name in registry.existing(name):
+            path.unlink()
+            removed += 1
     print(f"removed {removed} file(s) the registry already holds")
     return 0
 
@@ -507,14 +531,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     for name, handler, text in (
         ("targets", cmd_targets, "list the targets under packages/ and how each is read"),
-        ("download", cmd_download, "pip download every target into its wheelhouse/"),
+        ("download", cmd_download, "pip download every target into wheelhouse/"),
         ("publish", cmd_publish, "upload wheelhouse files the registry does not have"),
         ("prune", cmd_prune, "remove local copies of wheels the registry already has"),
         ("export", cmd_export, "tar every file the registry received since a date"),
         ("import", cmd_import, "verify bundles and upload what the registry lacks"),
     ):
         command = sub.add_parser(name, help=text)
-        if name not in ("export", "import"):
+        if name in ("targets", "download"):
             command.add_argument("--target", action="append", help="limit to this target (repeatable)")
         command.set_defaults(handler=handler)
         if name == "download":
@@ -527,7 +551,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             command.add_argument("--since", required=True, help="YYYY-MM-DD, first day to include")
             command.add_argument("--bundle", metavar="DIR", default="bundle", help="directory for the tar (default: bundle)")
         if name == "import":
-            command.add_argument("bundle", nargs="+", help="pypi-*.tar written by publish --bundle or export")
+            command.add_argument("bundle", nargs="+", help="pypi-*.tar written by publish --bundle or export, oldest first")
+            command.add_argument("--requirements", metavar="DIR",
+                                 help="also write the bundled requirements.txt and platforms.txt to DIR/<target>/")
     args = parser.parse_args(argv)
     try:
         return args.handler(args)

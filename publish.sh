@@ -1,5 +1,5 @@
 #!/bin/sh
-# Upload every wheel under packages/*/wheelhouse/ that the GitLab PyPI registry
+# Upload every wheel in wheelhouse/ that the GitLab PyPI registry
 # does not already hold. The same job as `mirror.py publish`, for a runner with
 # curl but no Python. Needs: curl, unzip, sha256sum (busybox has all three).
 #
@@ -35,7 +35,7 @@ case "$project" in
   *[!0-9]*) project=$(printf '%s' "$project" | sed 's|/|%2F|g') ;;
 esac
 base="${api%/}/projects/$project/packages/pypi"
-packages=${PACKAGES_DIR:-$(cd "$(dirname "$0")" && pwd)/packages}
+wheelhouse=${WHEELHOUSE_DIR:-$(cd "$(dirname "$0")" && pwd)/wheelhouse}
 
 # The token goes to curl on stdin as a config line, never on the command line.
 curl_auth() {
@@ -47,19 +47,15 @@ curl_auth() {
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-: > "$work/seen"
 total=0 uploaded=0 skipped=0
 
-for path in "$packages"/*/wheelhouse/*; do
+for path in "$wheelhouse"/*; do
   [ -f "$path" ] || continue
   file=${path##*/}
   case "$file" in
     *.whl) ;;
-    *) echo "WARNING: ignoring ${path#"$packages"/}: only wheels are published" >&2; continue ;;
+    *) echo "WARNING: ignoring wheelhouse/$file: only wheels are published" >&2; continue ;;
   esac
-  # The same wheel downloaded for two targets is one upload.
-  grep -qxF "$file" "$work/seen" && continue
-  echo "$file" >> "$work/seen"
   total=$((total + 1))
 
   stem=${file%.whl}

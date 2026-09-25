@@ -10,10 +10,10 @@
 4. Create the schedule: **Build > Pipeline schedules > New schedule**, target branch `main`, for example daily at 02:00.
 5. Run it once now: **Build > Pipelines > Run pipeline** on `main` with variable `MIRROR_SYNC` = `true`.
 6. Download the `sync` job's artifact and carry `delta/pypi-delta-*.tar` and its `.sha256` to the high side.
-7. On the high side, with `GITLAB_API_URL`, `PYPI_PROJECT` and `PYPI_TOKEN` set: `python3 mirror.py import pypi-delta-*.tar`
+7. On the high side, with `GITLAB_API_URL`, `PYPI_PROJECT` and `PYPI_TOKEN` set: `python3 mirror.py import pypi-delta-*.tar --requirements packages`
 
-You know it works when the `sync` log ends with `bundle: delta/pypi-delta-...tar (N file(s), ...)` and the high-side import reports `N uploaded`.
+You know it works when the `sync` log ends with `bundle: delta/pypi-delta-...tar (N file(s), ...)` and the high-side import reports `N uploaded` and writes each target's `requirements.txt` under `packages/`.
 
 If it fails:
-- A bundle expired before it crossed: add a masked `PYPI_TOKEN` CI variable (project access token, Reporter, `read_api`), run the pipeline with `EXPORT_SINCE` = the first missed day, then import the `export` job's bundle.
+- A bundle expired before it crossed: add a masked `EXPORT_TOKEN` CI variable (project access token, Reporter, `read_api`), run the pipeline with `EXPORT_SINCE` = the first missed day, then import the `export` job's bundle.
 - `sync` cannot reach PyPI: set the proxy variables in step 3, or add `tags:` for a runner with internet access to the `sync` job.
