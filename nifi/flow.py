@@ -101,8 +101,9 @@ def build(n, side, params):
     if side == "low":
         listen = n.processor(pg, "ListenHTTP", "receive bundle", 0,
                              {"Listening Port": "#{pypi.port}", "Base Path": "contentListener",
-                              # the sender's filename header replaces NiFi's generated one
-                              "HTTP Headers to receive as Attributes (Regex)": "filename|x-sha256"})
+                              # ListenHTTP takes the Filename header as the filename on its own;
+                              # X-Sha256, X-Artifact-Type and X-Bundle-Kind become attributes
+                              "HTTP Headers for Attributes": "(?i)x-.*"})
         n.connect(pg, listen, put, ["success"])
     else:
         ls = n.processor(pg, "ListFile", "list bundles", 0,

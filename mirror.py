@@ -36,6 +36,7 @@ import base64
 import email.parser
 import hashlib
 import html
+import http.client
 import io
 import json
 import os
@@ -67,6 +68,8 @@ ARCHES = {"linux": {"x86_64", "aarch64"}, "windows": {"amd64", "arm64", "win32"}
 MANYLINUX = os.environ.get("MANYLINUX", "2_28")
 # What a bundle carries besides wheels. Git needs git in the job image and a full clone (GIT_DEPTH 0).
 BUNDLE_REQUIREMENTS = os.environ.get("BUNDLE_REQUIREMENTS", "true").lower() in ("1", "true", "yes")
+# X-Artifact-Type on every NiFi POST, for RouteOnAttribute on a NiFi shared with other feeds.
+ARTIFACT_TYPE = "python-packages"
 BUNDLE_GIT = os.environ.get("BUNDLE_GIT", "false").lower() in ("1", "true", "yes")
 LAST_BUNDLE = ".last-bundle"  # what the last bundle carried besides wheels, kept in the CI cache
 
@@ -305,11 +308,19 @@ class Registry:
             page += 1
 
     def download(self, filename: str, sha256: str, dest: Path) -> Path:
-        path = dest / filename
-        data = self._get(f"{self.base}/files/{sha256}/{urllib.parse.quote(filename)}")
-        if hashlib.sha256(data).hexdigest() != sha256:
+        """Stream one file to disk, so a multi-GB wheel never sits in memory."""
+        path, digest = dest / filename, hashlib.sha256()
+        url = f"{self.base}/files/{sha256}/{urllib.parse.quote(filename)}"
+        try:
+            with self._request(urllib.request.Request(url)) as response, open(path, "wb") as out:
+                for chunk in iter(lambda: response.read(1 << 20), b""):
+                    digest.update(chunk)
+                    out.write(chunk)
+        except urllib.error.HTTPError as error:
+            raise MirrorError(f"GET {url}: HTTP {error.code}") from error
+        if digest.hexdigest() != sha256:
+            path.unlink()
             raise MirrorError(f"{filename}: sha256 mismatch after download")
-        path.write_bytes(data)
         return path
 
     def upload(self, path: Path) -> None:
@@ -424,25 +435,34 @@ def write_bundle(files: List[Path], out_dir: Path, kind: str,
     return path
 
 
-def post_bundle(path: Path, url: str) -> None:
+def post_bundle(path: Path, url: str, kind: str) -> None:
     """POST a bundle to NiFi's ListenHTTP, or anything else that takes a file in a POST body.
 
-    The name and sha256 go as headers: ListenHTTP turns them into flowfile attributes when
-    its "HTTP Headers to receive as Attributes (Regex)" matches them."""
-    context = ssl.create_default_context(cafile=os.environ.get("CA_BUNDLE") or None)
-    if os.environ.get("NIFI_CLIENT_CERT"):
-        context.load_cert_chain(os.environ["NIFI_CLIENT_CERT"], os.environ.get("NIFI_CLIENT_KEY") or None)
+    The X- headers become flowfile attributes when ListenHTTP's "HTTP Headers for Attributes"
+    regex matches them, named exactly as sent. http.client sends the names as written here;
+    urllib would rewrite them."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme == "https":
+        context = ssl.create_default_context(cafile=os.environ.get("CA_BUNDLE") or None)
+        if os.environ.get("NIFI_CLIENT_CERT"):
+            context.load_cert_chain(os.environ["NIFI_CLIENT_CERT"], os.environ.get("NIFI_CLIENT_KEY") or None)
+        conn = http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=600, context=context)
+    else:
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=600)
     headers = {"Content-Type": "application/x-tar", "Content-Length": str(path.stat().st_size),
-               "filename": path.name, "x-sha256": sha256_file(path)}
-    with open(path, "rb") as body:
-        request = urllib.request.Request(url, data=body, method="POST", headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=600, context=context):
-                pass
-        except urllib.error.HTTPError as error:
-            raise MirrorError(f"POST {path.name} to {url}: HTTP {error.code}") from error
-        except (urllib.error.URLError, OSError) as error:
-            raise MirrorError(f"POST {path.name} to {url}: {getattr(error, 'reason', error)}") from error
+               "Filename": path.name, "X-Sha256": sha256_file(path),
+               "X-Artifact-Type": ARTIFACT_TYPE, "X-Bundle-Kind": kind}
+    target = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+    try:
+        with open(path, "rb") as body:
+            conn.request("POST", target, body=body, headers=headers)
+            status = conn.getresponse().status
+    except OSError as error:
+        raise MirrorError(f"POST {path.name} to {url}: {error}") from error
+    finally:
+        conn.close()
+    if not 200 <= status < 300:
+        raise MirrorError(f"POST {path.name} to {url}: HTTP {status}")
     print(f"posted {path.name} to {url}")
 
 
@@ -543,7 +563,7 @@ def cmd_publish(args) -> int:
         if uploaded or (carries_extras and (not marker.is_file() or marker.read_text() != state)):
             bundle = write_bundle(uploaded, Path(args.bundle), "delta", definitions, head)
             if args.post:
-                post_bundle(bundle, args.post)
+                post_bundle(bundle, args.post, "delta")
             marker.write_text(state)  # after the POST, so a failed one is retried by the next run
         else:
             print("bundle: nothing new, no bundle written")
@@ -551,6 +571,8 @@ def cmd_publish(args) -> int:
 
 
 def cmd_export(args) -> int:
+    if not args.since:
+        raise MirrorError("export needs --since YYYY-MM-DD or EXPORT_SINCE")
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.since):
         raise MirrorError(f"--since {args.since!r}: expected YYYY-MM-DD")
     registry = Registry.from_env()
@@ -560,7 +582,7 @@ def cmd_export(args) -> int:
         paths = [registry.download(f["file"], f["sha256"], Path(tmp)) for f in wanted]
         bundle = write_bundle(paths, Path(args.bundle), f"since-{args.since}", *extras())
     if args.post:
-        post_bundle(bundle, args.post)
+        post_bundle(bundle, args.post, f"since-{args.since}")
     return 0
 
 
@@ -643,7 +665,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             command.add_argument("--post", metavar="URL", default=os.environ.get("NIFI_URL") or None,
                                  help="also POST each bundle to URL, such as a NiFi ListenHTTP (default: $NIFI_URL)")
         if name == "export":
-            command.add_argument("--since", required=True, help="YYYY-MM-DD, first day to include")
+            command.add_argument("--since", default=os.environ.get("EXPORT_SINCE") or None,
+                                 help="YYYY-MM-DD, first day to include (default: $EXPORT_SINCE)")
             command.add_argument("--bundle", metavar="DIR", default="bundle", help="directory for the tar (default: bundle)")
         if name == "import":
             command.add_argument("bundle", nargs="*", help="pypi-*.tar written by publish --bundle or export, oldest first")

@@ -110,6 +110,7 @@ class FakeGitLab(BaseHTTPRequestHandler):
         if self.path == "/contentListener":  # stands in for NiFi's ListenHTTP
             body = self.rfile.read(int(self.headers["Content-Length"]))
             self.server.posted.append((self.headers["filename"], self.headers["x-sha256"], body))
+            self.server.post_headers.append(dict(self.headers.items()))  # names as sent
             self.send_response(self.server.post_status)
             self.end_headers()
             return
@@ -243,7 +244,7 @@ class FakeRegistry(Workspace):
         FakeGitLab.files = {}
         self.server = HTTPServer(("127.0.0.1", 0), FakeGitLab)
         self.server.forward = False
-        self.server.posted, self.server.post_status = [], 200
+        self.server.posted, self.server.post_status, self.server.post_headers = [], 200, []
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -507,6 +508,30 @@ class BundleTests(FakeRegistry):
         [bundle] = self.bundles(out_dir)[-1:]
         name, sha256, body = self.server.posted[-1]
         self.assertEqual((name, sha256, body), (bundle.name, mirror.sha256_file(bundle), bundle.read_bytes()))
+
+    def test_post_headers_go_out_named_as_written_for_nifi_to_route_on(self):
+        # ListenHTTP names each attribute exactly as the header arrived.
+        make_wheel(self.target("linux-py3.12", "certifi\n"), "certifi-2026.7.22-py3-none-any.whl")
+        out_dir = Path(self.tmp.name) / "delta"
+        url = f"http://127.0.0.1:{self.server.server_port}/contentListener"
+        code, out = self.run_cli("publish", "--bundle", str(out_dir), "--post", url)
+        self.assertEqual(code, 0, out)
+        sent = self.server.post_headers[-1]
+        self.assertEqual(sent["X-Artifact-Type"], "python-packages")
+        self.assertEqual(sent["X-Bundle-Kind"], "delta")
+        self.assertIn("X-Sha256", sent)
+        self.assertIn("Filename", sent)
+
+    def test_export_reads_its_date_from_export_since(self):
+        os.environ["PYPI_TOKEN"], os.environ["PYPI_USERNAME"] = TOKEN, "gitlab-ci-token-as-pat"
+        self.server.now = "2026-09-20T10:00:00Z"
+        make_wheel(self.target("linux-py3.12"), "certifi-2026.7.22-py3-none-any.whl")
+        self.run_cli("publish")
+        out_dir = Path(self.tmp.name) / "export"
+        with mock.patch.dict(os.environ, {"EXPORT_SINCE": "2026-09-15"}):
+            code, out = self.run_cli("export", "--bundle", str(out_dir))
+        self.assertEqual(code, 0, out)
+        self.assertEqual([b.name.split("-")[1:3] for b in self.bundles(out_dir)], [["since", "2026"]])
 
     def test_inbox_imports_oldest_first_and_moves_each_bundle_to_done(self):
         make_wheel(self.target("linux-py3.12", "certifi\n"), "certifi-2026.7.22-py3-none-any.whl")

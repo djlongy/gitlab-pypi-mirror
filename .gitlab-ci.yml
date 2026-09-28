@@ -62,14 +62,19 @@ publish:
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" || $MIRROR_SYNC == "true" || $EXPORT_SINCE
       when: never
+    # A push that changes packages/ runs sync, which publishes the wheelhouse too.
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
       changes:
         - packages/**/*
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+      changes:
         - wheelhouse/**/*
     # Run pipeline / API on the default branch: re-check everything.
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(web|api)$/
 
-# Scheduled mirror: download, publish, and bundle only what this run uploaded.
+# Scheduled mirror, and every push that changes packages/: download, publish, and
+# bundle only what this run uploaded.
 sync:
   stage: publish
   resource_group: pypi-registry
@@ -92,6 +97,9 @@ sync:
     expire_in: 14 days
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && ($CI_PIPELINE_SOURCE == "schedule" || $MIRROR_SYNC == "true")
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+      changes:
+        - packages/**/*
 
 # Recovery: every file the registry received since EXPORT_SINCE, in one bundle.
 export:

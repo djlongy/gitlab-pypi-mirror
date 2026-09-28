@@ -58,7 +58,7 @@ The full set is in the argument parser and `Registry.from_env` in `mirror.py`.
 | Optional | `CA_BUNDLE` | system store | CA file for the GitLab API. Replaces the system store, so it holds the full chain |
 | Optional | `PYTHON_IMAGE` (CI) | `python:3.12-slim` | Job image with Python, or with curl, unzip and sha256sum; point it at your internal registry |
 | Optional | `MIRROR_SYNC` (CI) | unset | `true` on Run pipeline runs the scheduled `sync` job now |
-| Optional | `EXPORT_SINCE` (CI) | unset | `YYYY-MM-DD` on Run pipeline: bundle every file the registry received since then. Needs a masked CI variable: `EXPORT_TOKEN` (project access token, Reporter, `read_api`), or one `PYPI_TOKEN` (Developer, `api`) that every job then uses |
+| Optional | `EXPORT_SINCE` | unset | `YYYY-MM-DD`: `export` bundles every file the registry received since then. On Run pipeline it runs the `export` job, which needs a masked CI variable: `EXPORT_TOKEN` (project access token, Reporter, `read_api`), or one `PYPI_TOKEN` (Developer, `api`) that every job then uses. Locally it is the default for `--since` |
 | Optional | `BUNDLE_REQUIREMENTS` | `true` | Bundles carry each target's `requirements.txt` and `platforms.txt` |
 | Optional | `NIFI_URL` | unset | POST each new bundle here too, e.g. `https://nifi.example.com:9099/contentListener` |
 | When `NIFI_URL` is mutual TLS | `NIFI_CLIENT_CERT`, `NIFI_CLIENT_KEY` | unset | Client certificate and key files; `CA_BUNDLE` verifies the server |
@@ -95,7 +95,8 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
   pypi.org. Turn forwarding off so air-gapped clients fail fast instead of timing out.
 - Each upload carries the wheel's `Requires-Python`, so pip on 3.9 never picks a
   release that needs 3.10.
-- A pipeline schedule on the default branch runs `sync` instead of `publish`: it downloads
+- A pipeline schedule on the default branch, or a push that changes `packages/`, runs `sync`
+  instead of `publish`: it downloads
   in the job, publishes, and writes only the files this run uploaded to
   `delta/pypi-delta-<UTC>.tar` with a `.sha256`, kept as an artifact for 14 days.
   Unpinned requirements pick up new releases. `MANIFEST.json` names the commit. With
@@ -109,8 +110,16 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
   the bundled target files to `DIR/<target>/` and `--git-bundle FILE` the history;
   pass bundles oldest first so the newest wins. After a missed or expired bundle, run
   the pipeline with `EXPORT_SINCE` and import the `export` job's bundle.
-- With `NIFI_URL` set, `sync` and `export` also POST each bundle, with `filename` and
-  `x-sha256` headers. A refused POST fails the job, keeps the artifact, and the next run
+- An export too big for a job artifact runs from any machine that reaches this GitLab,
+  and writes the same tar to local disk to carry across by hand. It needs free space for
+  twice the bundle, and a token with `read_api`:
+  `GITLAB_API_URL=https://gitlab.example.com/api/v4 PYPI_PROJECT=platform/pypi-mirror PYPI_TOKEN=$TOKEN EXPORT_SINCE=2025-09-01 python3 mirror.py export --bundle bundle`
+- With `NIFI_URL` set, `sync` and `export` also POST each bundle, with the headers
+  `Filename`, `X-Sha256`, `X-Artifact-Type: python-packages` and `X-Bundle-Kind`
+  (`delta` or `since-YYYY-MM-DD`), sent exactly as written. ListenHTTP's
+  `HTTP Headers for Attributes` regex `(?i)x-.*` makes the `X-` ones attributes under
+  those names, for example `${X-Artifact-Type:equals('python-packages')}` in
+  RouteOnAttribute. The regex is case-sensitive without `(?i)`. A refused POST fails the job, keeps the artifact, and the next run
   sends a new bundle. `nifi/flow.py --side low` builds `ListenHTTP` -> `PutFile` into the
   diode; `--side high` builds `ListFile` -> `FetchFile` -> `PutFile` into an inbox. On the
   high side, a timer runs `mirror.py import --inbox DIR`, which imports every bundle
