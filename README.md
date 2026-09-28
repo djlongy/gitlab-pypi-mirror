@@ -115,7 +115,8 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
   twice the bundle, and a token with `read_api`:
   `GITLAB_API_URL=https://gitlab.example.com/api/v4 PYPI_PROJECT=platform/pypi-mirror PYPI_TOKEN=$TOKEN EXPORT_SINCE=2025-09-01 python3 mirror.py export --bundle bundle`
 - With `NIFI_URL` set, `sync` and `export` also POST each bundle, with the headers
-  `Filename`, `X-Sha256`, `X-Artifact-Type: python-packages` and `X-Bundle-Kind`
+  `Filename`, `X-Sha256`, `X-Artifact-Type: python-packages`, `X-Artifact-Format: tar`,
+  `X-Artifact-Action: mirror` and `X-Bundle-Kind`
   (`delta` or `since-YYYY-MM-DD`), sent exactly as written. ListenHTTP's
   `HTTP Headers for Attributes` regex `(?i)x-.*` makes the `X-` ones attributes under
   those names, for example `${X-Artifact-Type:equals('python-packages')}` in

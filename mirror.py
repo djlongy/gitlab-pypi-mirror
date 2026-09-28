@@ -68,8 +68,10 @@ ARCHES = {"linux": {"x86_64", "aarch64"}, "windows": {"amd64", "arm64", "win32"}
 MANYLINUX = os.environ.get("MANYLINUX", "2_28")
 # What a bundle carries besides wheels. Git needs git in the job image and a full clone (GIT_DEPTH 0).
 BUNDLE_REQUIREMENTS = os.environ.get("BUNDLE_REQUIREMENTS", "true").lower() in ("1", "true", "yes")
-# X-Artifact-Type on every NiFi POST, for RouteOnAttribute on a NiFi shared with other feeds.
+# X-Artifact-* on every NiFi POST, for RouteOnAttribute on a NiFi shared with other feeds.
 ARTIFACT_TYPE = "python-packages"
+ARTIFACT_FORMAT = "tar"
+ARTIFACT_ACTION = "mirror"
 BUNDLE_GIT = os.environ.get("BUNDLE_GIT", "false").lower() in ("1", "true", "yes")
 LAST_BUNDLE = ".last-bundle"  # what the last bundle carried besides wheels, kept in the CI cache
 
@@ -451,7 +453,8 @@ def post_bundle(path: Path, url: str, kind: str) -> None:
         conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=600)
     headers = {"Content-Type": "application/x-tar", "Content-Length": str(path.stat().st_size),
                "Filename": path.name, "X-Sha256": sha256_file(path),
-               "X-Artifact-Type": ARTIFACT_TYPE, "X-Bundle-Kind": kind}
+               "X-Artifact-Type": ARTIFACT_TYPE, "X-Artifact-Format": ARTIFACT_FORMAT,
+               "X-Artifact-Action": ARTIFACT_ACTION, "X-Bundle-Kind": kind}
     target = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
     try:
         with open(path, "rb") as body:
