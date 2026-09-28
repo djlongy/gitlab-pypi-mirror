@@ -102,7 +102,7 @@ def build(n, side, params):
         listen = n.processor(pg, "ListenHTTP", "receive bundle", 0,
                              {"Listening Port": "#{pypi.port}", "Base Path": "contentListener",
                               # ListenHTTP takes the Filename header as the filename on its own;
-                              # X-Sha256, X-Artifact-Type and X-Bundle-Kind become attributes
+                              # X-Sha256, X-Artifact-* and X-Bundle-Kind become attributes
                               "HTTP Headers for Attributes": "(?i)x-.*"})
         n.connect(pg, listen, put, ["success"])
     else:

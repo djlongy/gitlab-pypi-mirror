@@ -518,6 +518,8 @@ class BundleTests(FakeRegistry):
         self.assertEqual(code, 0, out)
         sent = self.server.post_headers[-1]
         self.assertEqual(sent["X-Artifact-Type"], "python-packages")
+        self.assertEqual(sent["X-Artifact-Format"], "tar")
+        self.assertEqual(sent["X-Artifact-Action"], "mirror")
         self.assertEqual(sent["X-Bundle-Kind"], "delta")
         self.assertIn("X-Sha256", sent)
         self.assertIn("Filename", sent)
