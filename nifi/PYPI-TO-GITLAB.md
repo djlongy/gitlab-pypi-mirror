@@ -74,6 +74,7 @@ Parameters: `gitlab.pypi.url`, `gitlab.username` (`__token__`, any value works),
    Developer, scope `api`. Note the project ID from **Settings > General**.
 2. Import the flow: drag a Process Group onto the canvas, choose **Upload**, and pick
    `nifi/pypi-to-gitlab.json`.
+   Where NiFi cannot import a file, build it by hand from `nifi/PYPI-TO-GITLAB-BY-HAND.md`.
 3. Open the `pypi-to-gitlab` parameter context and set `gitlab.pypi.url` to
    `https://<gitlab>/api/v4/projects/<id>/packages/pypi` and `gitlab.token` to the
    token. `gitlab.token` is sensitive, so it is never exported with the flow.
