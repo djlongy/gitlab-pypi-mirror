@@ -125,6 +125,9 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
   diode; `--side high` builds `ListFile` -> `FetchFile` -> `PutFile` into an inbox. On the
   high side, a timer runs `mirror.py import --inbox DIR`, which imports every bundle
   there oldest first and moves each to `DIR/done/`.
+  To publish straight from NiFi instead, import `nifi/pypi-to-gitlab.json`: native
+  processors unpack each bundle and upload every wheel to GitLab. Steps and the header
+  and tar reference are in `nifi/PYPI-TO-GITLAB.md`.
 - To make a high-side clone of this repository match the low side, discarding any
   high-side commits: `git fetch FILE HEAD:refs/remotes/low/main`, then
   `git push --force origin refs/remotes/low/main:refs/heads/main`. The push needs force
