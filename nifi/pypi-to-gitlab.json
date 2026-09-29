@@ -1,0 +1,1763 @@
+{
+  "flowContents": {
+    "identifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+    "instanceIdentifier": "eac2e638-01a0-1000-5134-c549eee62af4",
+    "name": "pypi-to-gitlab",
+    "comments": "",
+    "position": {
+      "x": 0.0,
+      "y": 0.0
+    },
+    "processGroups": [],
+    "remoteProcessGroups": [],
+    "processors": [
+      {
+        "identifier": "2ad73d24-1024-3c56-8441-6b630a132d02",
+        "instanceIdentifier": "eac2e6e5-01a0-1000-548b-21b374bac31d",
+        "name": "Hash bundle",
+        "comments": "",
+        "position": {
+          "x": 0.0,
+          "y": 544.0
+        },
+        "type": "org.apache.nifi.processors.standard.CryptographicHashContent",
+        "bundle": {
+          "group": "org.apache.nifi",
+          "artifact": "nifi-standard-nar",
+          "version": "2.11.0"
+        },
+        "properties": {
+          "Hash Algorithm": "SHA-256",
+          "Fail When Content Empty": "false"
+        },
+        "propertyDescriptors": {
+          "Hash Algorithm": {
+            "name": "Hash Algorithm",
+            "displayName": "Hash Algorithm",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Fail When Content Empty": {
+            "name": "Fail When Content Empty",
+            "displayName": "Fail When Content Empty",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 0,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "bc44f2c0-f050-35b0-9af4-66e1501f6e40",
+        "instanceIdentifier": "eac2e7fd-01a0-1000-2cb5-3931726731cd",
+        "name": "Uploaded",
+        "comments": "",
+        "position": {
+          "x": 0.0,
+          "y": 2176.0
+        },
+        "type": "org.apache.nifi.processors.attributes.UpdateAttribute",
+        "bundle": {
+          "group": "org.apache.nifi",
+          "artifact": "nifi-update-attribute-nar",
+          "version": "2.11.0"
+        },
+        "properties": {
+          "Delete Attributes Expression": null,
+          "Store State": "Do not store state",
+          "Cache Value Lookup Cache Size": "100",
+          "Stateful Variables Initial Value": null
+        },
+        "propertyDescriptors": {
+          "Delete Attributes Expression": {
+            "name": "Delete Attributes Expression",
+            "displayName": "Delete Attributes Expression",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Store State": {
+            "name": "Store State",
+            "displayName": "Store State",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Cache Value Lookup Cache Size": {
+            "name": "Cache Value Lookup Cache Size",
+            "displayName": "Cache Value Lookup Cache Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Stateful Variables Initial Value": {
+            "name": "Stateful Variables Initial Value",
+            "displayName": "Stateful Variables Initial Value",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 25,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [
+          "success"
+        ],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "8f31c6ab-db88-3f1f-aa6a-dc620cdefe40",
+        "instanceIdentifier": "eac2e6a1-01a0-1000-fd1b-f97ff29d6a9f",
+        "name": "Python packages only",
+        "comments": "",
+        "position": {
+          "x": 0.0,
+          "y": 272.0
+        },
+        "type": "org.apache.nifi.processors.standard.RouteOnAttribute",
+        "bundle": {
+          "group": "org.apache.nifi",
+          "artifact": "nifi-standard-nar",
+          "version": "2.11.0"
+        },
+        "properties": {
+          "Routing Strategy": "Route to Property name",
+          "python-packages": "${X-Artifact-Type:equals('python-packages'):and(${X-Artifact-Action:equals('mirror')}):and(${X-Artifact-Format:equals('tar')})}"
+        },
+        "propertyDescriptors": {
+          "Routing Strategy": {
+            "name": "Routing Strategy",
+            "displayName": "Routing Strategy",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "python-packages": {
+            "name": "python-packages",
+            "displayName": "python-packages",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": true
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 25,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [
+          "unmatched"
+        ],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "4e3dd506-d28e-3aed-92b3-cbedb7c73590",
+        "instanceIdentifier": "eac2e72f-01a0-1000-cc1e-faf60a6d6f7d",
+        "name": "Unpack wheels",
+        "comments": "",
+        "position": {
+          "x": 0.0,
+          "y": 1088.0
+        },
+        "type": "org.apache.nifi.processors.standard.UnpackContent",
+        "bundle": {
+          "group": "org.apache.nifi",
+          "artifact": "nifi-standard-nar",
+          "version": "2.11.0"
+        },
+        "properties": {
+          "Allow Stored Entries With Data Descriptor": "false",
+          "Packaging Format": "tar",
+          "Filename Character Set": "UTF-8",
+          "File Filter": "wheels/.*\\.whl"
+        },
+        "propertyDescriptors": {
+          "Allow Stored Entries With Data Descriptor": {
+            "name": "Allow Stored Entries With Data Descriptor",
+            "displayName": "Allow Stored Entries With Data Descriptor",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Packaging Format": {
+            "name": "Packaging Format",
+            "displayName": "Packaging Format",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Filename Character Set": {
+            "name": "Filename Character Set",
+            "displayName": "Filename Character Set",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "File Filter": {
+            "name": "File Filter",
+            "displayName": "File Filter",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Password": {
+            "name": "Password",
+            "displayName": "Password",
+            "identifiesControllerService": false,
+            "sensitive": true,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 0,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [
+          "original"
+        ],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "4ca4fd93-bfc3-3c58-8c3e-ad794f5ba5fa",
+        "instanceIdentifier": "eac2e80f-01a0-1000-4878-0a35f0dd1103",
+        "name": "Rejected (inspect queue)",
+        "comments": "",
+        "position": {
+          "x": 492.0,
+          "y": 816.0
+        },
+        "type": "org.apache.nifi.processors.attributes.UpdateAttribute",
+        "bundle": {
+          "group": "org.apache.nifi",
+          "artifact": "nifi-update-attribute-nar",
+          "version": "2.11.0"
+        },
+        "properties": {
+          "Delete Attributes Expression": null,
+          "Store State": "Do not store state",
+          "Cache Value Lookup Cache Size": "100",
+          "Stateful Variables Initial Value": null
+        },
+        "propertyDescriptors": {
+          "Delete Attributes Expression": {
+            "name": "Delete Attributes Expression",
+            "displayName": "Delete Attributes Expression",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Store State": {
+            "name": "Store State",
+            "displayName": "Store State",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Cache Value Lookup Cache Size": {
+            "name": "Cache Value Lookup Cache Size",
+            "displayName": "Cache Value Lookup Cache Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Stateful Variables Initial Value": {
+            "name": "Stateful Variables Initial Value",
+            "displayName": "Stateful Variables Initial Value",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 25,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [
+          "success"
+        ],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "206d4d55-4270-3d0d-beee-cb243ba93d91",
+        "instanceIdentifier": "eac2e7c7-01a0-1000-3abf-69b5a3b1dabb",
+        "name": "Upload to GitLab",
+        "comments": "",
+        "position": {
+          "x": 0.0,
+          "y": 1904.0
+        },
+        "type": "org.apache.nifi.processors.standard.InvokeHTTP",
+        "bundle": {
+          "group": "org.apache.nifi",
+          "artifact": "nifi-standard-nar",
+          "version": "2.11.0"
+        },
+        "properties": {
+          "Request Content-Encoding": "DISABLED",
+          "Request Multipart Form-Data Filename Enabled": "true",
+          "Request Chunked Transfer-Encoding Enabled": "false",
+          "Response Header Request Attributes Prefix": null,
+          "Proxy Configuration Service": null,
+          "HTTP/2 Disabled": "False",
+          "Connection Timeout": "5 secs",
+          "Response Cookie Strategy": "DISABLED",
+          "Request Password": "#{gitlab.token}",
+          "Socket Read Timeout": "15 secs",
+          "Socket Idle Connections": "5",
+          "Request Body Enabled": "true",
+          "OAuth2 Access Token Refresh Strategy": "ON_TOKEN_EXPIRATION",
+          "HTTP URL": "#{gitlab.pypi.url}",
+          "Request OAuth2 Access Token Provider": null,
+          "post:form:name": "${pypi.name}",
+          "Socket Idle Timeout": "5 mins",
+          "Response Redirects Enabled": "True",
+          "Socket Write Timeout": "15 secs",
+          "Request Header Attributes Pattern": null,
+          "Response FlowFile Naming Strategy": "RANDOM",
+          "Response Cache Enabled": "false",
+          "post:form:version": "${pypi.version}",
+          "Request Date Header Enabled": "True",
+          "Request Failure Penalization Enabled": "false",
+          "Response Body Attribute Size": "256",
+          "SSL Context Service": null,
+          "Response Generation Required": "false",
+          "Request User-Agent": null,
+          "Response Header Request Attributes Enabled": "false",
+          "HTTP Method": "POST",
+          "Request Username": "#{gitlab.username}",
+          "Request Content-Type": "${mime.type}",
+          "post:form:sha256_digest": "${content_SHA-256}",
+          "Response Body Attribute Name": "gitlab.response",
+          "Request Digest Authentication Enabled": "false",
+          "Request Multipart Form-Data Name": "content",
+          "Response Cache Size": "10MB",
+          "Response Body Ignored": "false"
+        },
+        "propertyDescriptors": {
+          "Request Content-Encoding": {
+            "name": "Request Content-Encoding",
+            "displayName": "Request Content-Encoding",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Request Multipart Form-Data Filename Enabled": {
+            "name": "Request Multipart Form-Data Filename Enabled",
+            "displayName": "Request Multipart Form-Data Filename Enabled",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Request Chunked Transfer-Encoding Enabled": {
+            "name": "Request Chunked Transfer-Encoding Enabled",
+            "displayName": "Request Chunked Transfer-Encoding Enabled",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Response Header Request Attributes Prefix": {
+            "name": "Response Header Request Attributes Prefix",
+            "displayName": "Response Header Request Attributes Prefix",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Proxy Configuration Service": {
+            "name": "Proxy Configuration Service",
+            "displayName": "Proxy Configuration Service",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "HTTP/2 Disabled": {
+            "name": "HTTP/2 Disabled",
+            "displayName": "HTTP/2 Disabled",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Connection Timeout": {
+            "name": "Connection Timeout",
+            "displayName": "Connection Timeout",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Response Cookie Strategy": {
+            "name": "Response Cookie Strategy",
+            "displayName": "Response Cookie Strategy",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Request Password": {
+            "name": "Request Password",
+            "displayName": "Request Password",
+            "identifiesControllerService": false,
+            "sensitive": true,
+            "dynamic": false
+          },
+          "Socket Read Timeout": {
+            "name": "Socket Read Timeout",
+            "displayName": "Socket Read Timeout",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Socket Idle Connections": {
+            "name": "Socket Idle Connections",
+            "displayName": "Socket Idle Connections",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Request Body Enabled": {
+            "name": "Request Body Enabled",
+            "displayName": "Request Body Enabled",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "OAuth2 Access Token Refresh Strategy": {
+            "name": "OAuth2 Access Token Refresh Strategy",
+            "displayName": "OAuth2 Access Token Refresh Strategy",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "HTTP URL": {
+            "name": "HTTP URL",
+            "displayName": "HTTP URL",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Request OAuth2 Access Token Provider": {
+            "name": "Request OAuth2 Access Token Provider",
+            "displayName": "Request OAuth2 Access Token Provider",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "post:form:name": {
+            "name": "post:form:name",
+            "displayName": "post:form:name",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": true
+          },
+          "Socket Idle Timeout": {
+            "name": "Socket Idle Timeout",
+            "displayName": "Socket Idle Timeout",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Response Redirects Enabled": {
+            "name": "Response Redirects Enabled",
+            "displayName": "Response Redirects Enabled",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Socket Write Timeout": {
+            "name": "Socket Write Timeout",
+            "displayName": "Socket Write Timeout",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Request Header Attributes Pattern": {
+            "name": "Request Header Attributes Pattern",
+            "displayName": "Request Header Attributes Pattern",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Response FlowFile Naming Strategy": {
+            "name": "Response FlowFile Naming Strategy",
+            "displayName": "Response FlowFile Naming Strategy",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Response Cache Enabled": {
+            "name": "Response Cache Enabled",
+            "displayName": "Response Cache Enabled",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "post:form:version": {
+            "name": "post:form:version",
+            "displayName": "post:form:version",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": true
+          },
+          "Request Date Header Enabled": {
+            "name": "Request Date Header Enabled",
+            "displayName": "Request Date Header Enabled",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Request Failure Penalization Enabled": {
+            "name": "Request Failure Penalization Enabled",
+            "displayName": "Request Failure Penalization Enabled",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Response Body Attribute Size": {
+            "name": "Response Body Attribute Size",
+            "displayName": "Response Body Attribute Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "SSL Context Service": {
+            "name": "SSL Context Service",
+            "displayName": "SSL Context Service",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Response Generation Required": {
+            "name": "Response Generation Required",
+            "displayName": "Response Generation Required",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Request User-Agent": {
+            "name": "Request User-Agent",
+            "displayName": "Request User-Agent",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Response Header Request Attributes Enabled": {
+            "name": "Response Header Request Attributes Enabled",
+            "displayName": "Response Header Request Attributes Enabled",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "HTTP Method": {
+            "name": "HTTP Method",
+            "displayName": "HTTP Method",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Request Username": {
+            "name": "Request Username",
+            "displayName": "Request Username",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Request Content-Type": {
+            "name": "Request Content-Type",
+            "displayName": "Request Content-Type",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "post:form:sha256_digest": {
+            "name": "post:form:sha256_digest",
+            "displayName": "post:form:sha256_digest",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": true
+          },
+          "Response Body Attribute Name": {
+            "name": "Response Body Attribute Name",
+            "displayName": "Response Body Attribute Name",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Request Digest Authentication Enabled": {
+            "name": "Request Digest Authentication Enabled",
+            "displayName": "Request Digest Authentication Enabled",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Request Multipart Form-Data Name": {
+            "name": "Request Multipart Form-Data Name",
+            "displayName": "Request Multipart Form-Data Name",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Response Cache Size": {
+            "name": "Response Cache Size",
+            "displayName": "Response Cache Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Response Body Ignored": {
+            "name": "Response Body Ignored",
+            "displayName": "Response Body Ignored",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 0,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [
+          "Response"
+        ],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "7e4fa7d4-eb1c-3a56-8506-7421574eeb3a",
+        "instanceIdentifier": "eac2e7e0-01a0-1000-6a96-f58104b89067",
+        "name": "Already in GitLab",
+        "comments": "",
+        "position": {
+          "x": 492.0,
+          "y": 2176.0
+        },
+        "type": "org.apache.nifi.processors.standard.RouteOnAttribute",
+        "bundle": {
+          "group": "org.apache.nifi",
+          "artifact": "nifi-standard-nar",
+          "version": "2.11.0"
+        },
+        "properties": {
+          "Routing Strategy": "Route to Property name",
+          "duplicate": "${invokehttp.status.code:equals('400'):and(${gitlab.response:contains('taken')})}"
+        },
+        "propertyDescriptors": {
+          "Routing Strategy": {
+            "name": "Routing Strategy",
+            "displayName": "Routing Strategy",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "duplicate": {
+            "name": "duplicate",
+            "displayName": "duplicate",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": true
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 25,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "d2a25f9e-172f-36f8-9821-d280cbe3de74",
+        "instanceIdentifier": "eac2e666-01a0-1000-7d45-b65ba2f196f6",
+        "name": "Receive bundle",
+        "comments": "",
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "type": "org.apache.nifi.processors.standard.ListenHTTP",
+        "bundle": {
+          "group": "org.apache.nifi",
+          "artifact": "nifi-standard-nar",
+          "version": "2.11.0"
+        },
+        "properties": {
+          "HTTP Headers for Attributes": "(?i)x-.*",
+          "Multipart Request Max Size": "1 MB",
+          "Authorized Issuer DN Pattern": ".*",
+          "Listening Port for Health Check Requests": null,
+          "Request Header Maximum Size": "8 KB",
+          "Maximum Thread Pool Size": "200",
+          "Multipart Read Buffer Size": "512 KB",
+          "Record Reader": null,
+          "HTTP Protocols": "HTTP_1_1",
+          "Authorized Subject DN Pattern": ".*",
+          "Base Path": "contentListener",
+          "SSL Context Service": null,
+          "Max Unconfirmed Flowfile Time": "60 secs",
+          "Return Code": "200",
+          "Record Writer": null,
+          "Listening Port": "#{listen.port}",
+          "Client Authentication": "AUTO"
+        },
+        "propertyDescriptors": {
+          "HTTP Headers for Attributes": {
+            "name": "HTTP Headers for Attributes",
+            "displayName": "HTTP Headers for Attributes",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Multipart Request Max Size": {
+            "name": "Multipart Request Max Size",
+            "displayName": "Multipart Request Max Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Authorized Issuer DN Pattern": {
+            "name": "Authorized Issuer DN Pattern",
+            "displayName": "Authorized Issuer DN Pattern",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Listening Port for Health Check Requests": {
+            "name": "Listening Port for Health Check Requests",
+            "displayName": "Listening Port for Health Check Requests",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false,
+            "listenPortDefinition": {
+              "transportProtocol": "TCP",
+              "applicationProtocols": [
+                "http/1.1",
+                "h2"
+              ]
+            }
+          },
+          "Request Header Maximum Size": {
+            "name": "Request Header Maximum Size",
+            "displayName": "Request Header Maximum Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Maximum Thread Pool Size": {
+            "name": "Maximum Thread Pool Size",
+            "displayName": "Maximum Thread Pool Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Multipart Read Buffer Size": {
+            "name": "Multipart Read Buffer Size",
+            "displayName": "Multipart Read Buffer Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Record Reader": {
+            "name": "Record Reader",
+            "displayName": "Record Reader",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "HTTP Protocols": {
+            "name": "HTTP Protocols",
+            "displayName": "HTTP Protocols",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Authorized Subject DN Pattern": {
+            "name": "Authorized Subject DN Pattern",
+            "displayName": "Authorized Subject DN Pattern",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Base Path": {
+            "name": "Base Path",
+            "displayName": "Base Path",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "SSL Context Service": {
+            "name": "SSL Context Service",
+            "displayName": "SSL Context Service",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Max Unconfirmed Flowfile Time": {
+            "name": "Max Unconfirmed Flowfile Time",
+            "displayName": "Max Unconfirmed Flowfile Time",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Return Code": {
+            "name": "Return Code",
+            "displayName": "Return Code",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Record Writer": {
+            "name": "Record Writer",
+            "displayName": "Record Writer",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Listening Port": {
+            "name": "Listening Port",
+            "displayName": "Listening Port",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false,
+            "listenPortDefinition": {
+              "transportProtocol": "TCP",
+              "applicationProtocols": [
+                "http/1.1",
+                "h2"
+              ]
+            }
+          },
+          "Client Authentication": {
+            "name": "Client Authentication",
+            "displayName": "Client Authentication",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 0,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "90ffa166-cb85-3465-9c80-efea8b2c981a",
+        "instanceIdentifier": "eac2e781-01a0-1000-2fdf-e20c972c485b",
+        "name": "Name and version from filename",
+        "comments": "",
+        "position": {
+          "x": 0.0,
+          "y": 1632.0
+        },
+        "type": "org.apache.nifi.processors.attributes.UpdateAttribute",
+        "bundle": {
+          "group": "org.apache.nifi",
+          "artifact": "nifi-update-attribute-nar",
+          "version": "2.11.0"
+        },
+        "properties": {
+          "Delete Attributes Expression": null,
+          "pypi.version": "${filename:substringAfter('-'):substringBefore('-')}",
+          "Store State": "Do not store state",
+          "pypi.name": "${filename:substringBefore('-')}",
+          "Cache Value Lookup Cache Size": "100",
+          "Stateful Variables Initial Value": null
+        },
+        "propertyDescriptors": {
+          "Delete Attributes Expression": {
+            "name": "Delete Attributes Expression",
+            "displayName": "Delete Attributes Expression",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "pypi.version": {
+            "name": "pypi.version",
+            "displayName": "pypi.version",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": true
+          },
+          "Store State": {
+            "name": "Store State",
+            "displayName": "Store State",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "pypi.name": {
+            "name": "pypi.name",
+            "displayName": "pypi.name",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": true
+          },
+          "Cache Value Lookup Cache Size": {
+            "name": "Cache Value Lookup Cache Size",
+            "displayName": "Cache Value Lookup Cache Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Stateful Variables Initial Value": {
+            "name": "Stateful Variables Initial Value",
+            "displayName": "Stateful Variables Initial Value",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 25,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "9d6c4e54-785e-3374-bee2-cf9a29a215b8",
+        "instanceIdentifier": "eac2e75f-01a0-1000-0380-905506ae40be",
+        "name": "Hash wheel",
+        "comments": "",
+        "position": {
+          "x": 0.0,
+          "y": 1360.0
+        },
+        "type": "org.apache.nifi.processors.standard.CryptographicHashContent",
+        "bundle": {
+          "group": "org.apache.nifi",
+          "artifact": "nifi-standard-nar",
+          "version": "2.11.0"
+        },
+        "properties": {
+          "Hash Algorithm": "SHA-256",
+          "Fail When Content Empty": "false"
+        },
+        "propertyDescriptors": {
+          "Hash Algorithm": {
+            "name": "Hash Algorithm",
+            "displayName": "Hash Algorithm",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Fail When Content Empty": {
+            "name": "Fail When Content Empty",
+            "displayName": "Fail When Content Empty",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 0,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "b41b2aa3-4f77-3d56-9645-a09c9fde93d1",
+        "instanceIdentifier": "eac2e70e-01a0-1000-8c61-837f9b0cceb6",
+        "name": "Bundle matches X-Sha256",
+        "comments": "",
+        "position": {
+          "x": 0.0,
+          "y": 816.0
+        },
+        "type": "org.apache.nifi.processors.standard.RouteOnAttribute",
+        "bundle": {
+          "group": "org.apache.nifi",
+          "artifact": "nifi-standard-nar",
+          "version": "2.11.0"
+        },
+        "properties": {
+          "Routing Strategy": "Route to Property name",
+          "verified": "${content_SHA-256:equals(${X-Sha256})}"
+        },
+        "propertyDescriptors": {
+          "Routing Strategy": {
+            "name": "Routing Strategy",
+            "displayName": "Routing Strategy",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "verified": {
+            "name": "verified",
+            "displayName": "verified",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": true
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 25,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      }
+    ],
+    "inputPorts": [],
+    "outputPorts": [],
+    "connections": [
+      {
+        "identifier": "a2e6b08c-08ed-3ba8-b99e-232d26ed19b7",
+        "instanceIdentifier": "eac2e8b3-01a0-1000-2e33-a0ce5dfff812",
+        "source": {
+          "id": "4e3dd506-d28e-3aed-92b3-cbedb7c73590",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Unpack wheels",
+          "comments": "",
+          "instanceIdentifier": "eac2e72f-01a0-1000-cc1e-faf60a6d6f7d"
+        },
+        "destination": {
+          "id": "4ca4fd93-bfc3-3c58-8c3e-ad794f5ba5fa",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Rejected (inspect queue)",
+          "comments": "",
+          "instanceIdentifier": "eac2e80f-01a0-1000-4878-0a35f0dd1103"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "failure"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "b2c59f89-2d3a-373a-a342-f91adfe2f089",
+        "instanceIdentifier": "eac2e8e6-01a0-1000-22dc-9dd0a397cfc4",
+        "source": {
+          "id": "90ffa166-cb85-3465-9c80-efea8b2c981a",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Name and version from filename",
+          "comments": "",
+          "instanceIdentifier": "eac2e781-01a0-1000-2fdf-e20c972c485b"
+        },
+        "destination": {
+          "id": "206d4d55-4270-3d0d-beee-cb243ba93d91",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Upload to GitLab",
+          "comments": "",
+          "instanceIdentifier": "eac2e7c7-01a0-1000-3abf-69b5a3b1dabb"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "success"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "9fcea6b6-b801-374d-b390-70f23422babd",
+        "instanceIdentifier": "eac2e846-01a0-1000-047f-6071dcd8ba62",
+        "source": {
+          "id": "8f31c6ab-db88-3f1f-aa6a-dc620cdefe40",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Python packages only",
+          "comments": "",
+          "instanceIdentifier": "eac2e6a1-01a0-1000-fd1b-f97ff29d6a9f"
+        },
+        "destination": {
+          "id": "2ad73d24-1024-3c56-8441-6b630a132d02",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Hash bundle",
+          "comments": "",
+          "instanceIdentifier": "eac2e6e5-01a0-1000-548b-21b374bac31d"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "python-packages"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "2ddaaa36-6d5c-31dc-83f2-76ffd99e75a3",
+        "instanceIdentifier": "eac2e929-01a0-1000-a8f2-174c509ade2b",
+        "source": {
+          "id": "206d4d55-4270-3d0d-beee-cb243ba93d91",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Upload to GitLab",
+          "comments": "",
+          "instanceIdentifier": "eac2e7c7-01a0-1000-3abf-69b5a3b1dabb"
+        },
+        "destination": {
+          "id": "4ca4fd93-bfc3-3c58-8c3e-ad794f5ba5fa",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Rejected (inspect queue)",
+          "comments": "",
+          "instanceIdentifier": "eac2e80f-01a0-1000-4878-0a35f0dd1103"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "Failure"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "e250ade5-e374-35f1-b439-d05ac9de00de",
+        "instanceIdentifier": "eac2e86b-01a0-1000-520f-4e3acc0fc267",
+        "source": {
+          "id": "2ad73d24-1024-3c56-8441-6b630a132d02",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Hash bundle",
+          "comments": "",
+          "instanceIdentifier": "eac2e6e5-01a0-1000-548b-21b374bac31d"
+        },
+        "destination": {
+          "id": "4ca4fd93-bfc3-3c58-8c3e-ad794f5ba5fa",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Rejected (inspect queue)",
+          "comments": "",
+          "instanceIdentifier": "eac2e80f-01a0-1000-4878-0a35f0dd1103"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "failure"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "6a646264-d367-3391-9809-9c35eb762572",
+        "instanceIdentifier": "eac2e88f-01a0-1000-38ff-55aa6aba8ffe",
+        "source": {
+          "id": "b41b2aa3-4f77-3d56-9645-a09c9fde93d1",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Bundle matches X-Sha256",
+          "comments": "",
+          "instanceIdentifier": "eac2e70e-01a0-1000-8c61-837f9b0cceb6"
+        },
+        "destination": {
+          "id": "4ca4fd93-bfc3-3c58-8c3e-ad794f5ba5fa",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Rejected (inspect queue)",
+          "comments": "",
+          "instanceIdentifier": "eac2e80f-01a0-1000-4878-0a35f0dd1103"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "unmatched"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "96ee1afa-99e3-3ae8-af2d-cdbd40c3c60d",
+        "instanceIdentifier": "eac2e8f7-01a0-1000-5747-4013c3afc8e3",
+        "source": {
+          "id": "206d4d55-4270-3d0d-beee-cb243ba93d91",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Upload to GitLab",
+          "comments": "",
+          "instanceIdentifier": "eac2e7c7-01a0-1000-3abf-69b5a3b1dabb"
+        },
+        "destination": {
+          "id": "bc44f2c0-f050-35b0-9af4-66e1501f6e40",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Uploaded",
+          "comments": "",
+          "instanceIdentifier": "eac2e7fd-01a0-1000-2cb5-3931726731cd"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "Original"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "0b2661c5-395d-3ea0-937f-bf8c0b013ca8",
+        "instanceIdentifier": "eac2e8c4-01a0-1000-92c3-38c35e5f59e7",
+        "source": {
+          "id": "9d6c4e54-785e-3374-bee2-cf9a29a215b8",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Hash wheel",
+          "comments": "",
+          "instanceIdentifier": "eac2e75f-01a0-1000-0380-905506ae40be"
+        },
+        "destination": {
+          "id": "90ffa166-cb85-3465-9c80-efea8b2c981a",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Name and version from filename",
+          "comments": "",
+          "instanceIdentifier": "eac2e781-01a0-1000-2fdf-e20c972c485b"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "success"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "a5de3aee-1b73-3076-af8f-8e2bf7c3a98e",
+        "instanceIdentifier": "eac2e823-01a0-1000-1d5a-fbabf5341178",
+        "source": {
+          "id": "d2a25f9e-172f-36f8-9821-d280cbe3de74",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Receive bundle",
+          "comments": "",
+          "instanceIdentifier": "eac2e666-01a0-1000-7d45-b65ba2f196f6"
+        },
+        "destination": {
+          "id": "8f31c6ab-db88-3f1f-aa6a-dc620cdefe40",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Python packages only",
+          "comments": "",
+          "instanceIdentifier": "eac2e6a1-01a0-1000-fd1b-f97ff29d6a9f"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "success"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "bf08206b-88d8-3d02-95f5-fff084f2837c",
+        "instanceIdentifier": "eac2e909-01a0-1000-512f-5daf559d8056",
+        "source": {
+          "id": "206d4d55-4270-3d0d-beee-cb243ba93d91",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Upload to GitLab",
+          "comments": "",
+          "instanceIdentifier": "eac2e7c7-01a0-1000-3abf-69b5a3b1dabb"
+        },
+        "destination": {
+          "id": "206d4d55-4270-3d0d-beee-cb243ba93d91",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Upload to GitLab",
+          "comments": "",
+          "instanceIdentifier": "eac2e7c7-01a0-1000-3abf-69b5a3b1dabb"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "Retry"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "a46f7b71-0f61-329a-88da-4f58e36980f0",
+        "instanceIdentifier": "eac2e94e-01a0-1000-cdfd-baabe43e8d74",
+        "source": {
+          "id": "7e4fa7d4-eb1c-3a56-8506-7421574eeb3a",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Already in GitLab",
+          "comments": "",
+          "instanceIdentifier": "eac2e7e0-01a0-1000-6a96-f58104b89067"
+        },
+        "destination": {
+          "id": "4ca4fd93-bfc3-3c58-8c3e-ad794f5ba5fa",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Rejected (inspect queue)",
+          "comments": "",
+          "instanceIdentifier": "eac2e80f-01a0-1000-4878-0a35f0dd1103"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "unmatched"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "54a4e2bd-f36c-3847-ad37-b68af372df65",
+        "instanceIdentifier": "eac2e93e-01a0-1000-41d5-b604f8369b3a",
+        "source": {
+          "id": "7e4fa7d4-eb1c-3a56-8506-7421574eeb3a",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Already in GitLab",
+          "comments": "",
+          "instanceIdentifier": "eac2e7e0-01a0-1000-6a96-f58104b89067"
+        },
+        "destination": {
+          "id": "bc44f2c0-f050-35b0-9af4-66e1501f6e40",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Uploaded",
+          "comments": "",
+          "instanceIdentifier": "eac2e7fd-01a0-1000-2cb5-3931726731cd"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "duplicate"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "b90fe2a6-3288-3c94-a739-43e3b4e956da",
+        "instanceIdentifier": "eac2e8d5-01a0-1000-373c-ae68496338e7",
+        "source": {
+          "id": "9d6c4e54-785e-3374-bee2-cf9a29a215b8",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Hash wheel",
+          "comments": "",
+          "instanceIdentifier": "eac2e75f-01a0-1000-0380-905506ae40be"
+        },
+        "destination": {
+          "id": "4ca4fd93-bfc3-3c58-8c3e-ad794f5ba5fa",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Rejected (inspect queue)",
+          "comments": "",
+          "instanceIdentifier": "eac2e80f-01a0-1000-4878-0a35f0dd1103"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "failure"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "7b9a0419-2c0b-3892-be06-b75d3b1535ae",
+        "instanceIdentifier": "eac2e87c-01a0-1000-c184-bc65564759b3",
+        "source": {
+          "id": "b41b2aa3-4f77-3d56-9645-a09c9fde93d1",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Bundle matches X-Sha256",
+          "comments": "",
+          "instanceIdentifier": "eac2e70e-01a0-1000-8c61-837f9b0cceb6"
+        },
+        "destination": {
+          "id": "4e3dd506-d28e-3aed-92b3-cbedb7c73590",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Unpack wheels",
+          "comments": "",
+          "instanceIdentifier": "eac2e72f-01a0-1000-cc1e-faf60a6d6f7d"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "verified"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "f0833c90-8180-32d4-96c9-4acaac492997",
+        "instanceIdentifier": "eac2e85b-01a0-1000-0555-20e9a078f6c1",
+        "source": {
+          "id": "2ad73d24-1024-3c56-8441-6b630a132d02",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Hash bundle",
+          "comments": "",
+          "instanceIdentifier": "eac2e6e5-01a0-1000-548b-21b374bac31d"
+        },
+        "destination": {
+          "id": "b41b2aa3-4f77-3d56-9645-a09c9fde93d1",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Bundle matches X-Sha256",
+          "comments": "",
+          "instanceIdentifier": "eac2e70e-01a0-1000-8c61-837f9b0cceb6"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "success"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "f5ea6802-d0a5-3c56-b668-d3b0f691c6ec",
+        "instanceIdentifier": "eac2e918-01a0-1000-099f-a2fe171a8856",
+        "source": {
+          "id": "206d4d55-4270-3d0d-beee-cb243ba93d91",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Upload to GitLab",
+          "comments": "",
+          "instanceIdentifier": "eac2e7c7-01a0-1000-3abf-69b5a3b1dabb"
+        },
+        "destination": {
+          "id": "7e4fa7d4-eb1c-3a56-8506-7421574eeb3a",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Already in GitLab",
+          "comments": "",
+          "instanceIdentifier": "eac2e7e0-01a0-1000-6a96-f58104b89067"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "No Retry"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      },
+      {
+        "identifier": "21ab7a37-d84c-3206-83d4-dec0ac2f8f09",
+        "instanceIdentifier": "eac2e8a2-01a0-1000-25d2-53d31e0d631e",
+        "source": {
+          "id": "4e3dd506-d28e-3aed-92b3-cbedb7c73590",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Unpack wheels",
+          "comments": "",
+          "instanceIdentifier": "eac2e72f-01a0-1000-cc1e-faf60a6d6f7d"
+        },
+        "destination": {
+          "id": "9d6c4e54-785e-3374-bee2-cf9a29a215b8",
+          "type": "PROCESSOR",
+          "groupId": "6aaad2f0-89e9-3cad-95fc-246339f81b18",
+          "name": "Hash wheel",
+          "comments": "",
+          "instanceIdentifier": "eac2e75f-01a0-1000-0380-905506ae40be"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "success"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "6aaad2f0-89e9-3cad-95fc-246339f81b18"
+      }
+    ],
+    "labels": [],
+    "funnels": [],
+    "controllerServices": [],
+    "parameterContextName": "pypi-to-gitlab",
+    "defaultFlowFileExpiration": "0 sec",
+    "defaultBackPressureObjectThreshold": 10000,
+    "defaultBackPressureDataSizeThreshold": "1 GB",
+    "scheduledState": "ENABLED",
+    "executionEngine": "INHERITED",
+    "maxConcurrentTasks": 1,
+    "statelessFlowTimeout": "1 min",
+    "flowFileConcurrency": "UNBOUNDED",
+    "flowFileOutboundPolicy": "STREAM_WHEN_AVAILABLE",
+    "componentType": "PROCESS_GROUP"
+  },
+  "externalControllerServices": {},
+  "parameterContexts": {
+    "pypi-to-gitlab": {
+      "name": "pypi-to-gitlab",
+      "parameters": [
+        {
+          "name": "gitlab.token",
+          "description": "Project or group access token, role Developer, scope api",
+          "sensitive": true,
+          "provided": false,
+          "value": null
+        },
+        {
+          "name": "gitlab.username",
+          "description": "Any value: GitLab reads only the token",
+          "sensitive": false,
+          "provided": false,
+          "value": "__token__"
+        },
+        {
+          "name": "gitlab.pypi.url",
+          "description": "https://<gitlab>/api/v4/projects/<id>/packages/pypi",
+          "sensitive": false,
+          "provided": false,
+          "value": "https://gitlab.example.com/api/v4/projects/<id>/packages/pypi"
+        },
+        {
+          "name": "listen.port",
+          "sensitive": false,
+          "provided": false,
+          "value": "9090"
+        }
+      ],
+      "inheritedParameterContexts": [],
+      "description": "GitLab PyPI registry the bundles publish into",
+      "componentType": "PARAMETER_CONTEXT"
+    }
+  },
+  "flowEncodingVersion": "1.0",
+  "parameterProviders": {},
+  "latest": false
+}
