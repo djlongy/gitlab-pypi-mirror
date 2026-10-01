@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "enabledManagers": ["pip_requirements"],
+  "constraintsFiltering": "strict",
+  "separateMajorMinor": false,
+  "packageRules": [
+    {
+      "groupName": "Python 3.9 packages",
+      "matchFileNames": ["packages/*-py3.9/**", "packages/*-py3.9-*/**"],
+      "constraints": { "python": "3.9" }
+    },
+    {
+      "groupName": "Python 3.12 packages",
+      "matchFileNames": ["packages/*-py3.12/**", "packages/*-py3.12-*/**"],
+      "constraints": { "python": "3.12" }
+    },
+    {
+      "groupName": "Python 3.14 packages",
+      "matchFileNames": ["packages/*-py3.14/**", "packages/*-py3.14-*/**"],
+      "constraints": { "python": "3.14" }
+    }
+  ]
+}

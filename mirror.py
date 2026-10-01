@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import base64
 import email.parser
+import fnmatch
 import hashlib
 import html
 import http.client
@@ -142,6 +143,33 @@ def find_targets(only: Optional[List[str]] = None) -> List[Target]:
             raise MirrorError(f"no such target: {', '.join(sorted(unknown))}")
         targets = [t for t in targets if t.name in only]
     return targets
+
+
+def renovate_gaps(targets: List[Target]) -> List[str]:
+    """Targets renovate.json does not hold to their Python version. No renovate.json, no gaps."""
+    path = ROOT / "renovate.json"
+    if not path.is_file():
+        return []
+    config = json.loads(path.read_text())
+    gaps = [] if config.get("constraintsFiltering") == "strict" else [
+        'renovate.json: set "constraintsFiltering": "strict", or Renovate ignores the Python constraints'
+    ]
+    for target in targets:
+        file = f"packages/{target.name}/requirements.txt"
+        pythons = sorted({
+            rule["constraints"]["python"] for rule in config.get("packageRules", [])
+            if "python" in rule.get("constraints", {})
+            and any(fnmatch.fnmatchcase(file, glob) for glob in rule.get("matchFileNames", []))
+        })
+        if pythons != [target.python]:
+            gaps.append(
+                f"{target.name}: renovate.json gives Python {', '.join(pythons) or 'nothing'}, expected "
+                f"{target.python}. Add to packageRules: "
+                f'{{"groupName": "Python {target.python} packages", "matchFileNames": '
+                f'["packages/*-py{target.python}/**", "packages/*-py{target.python}-*/**"], '
+                f'"constraints": {{"python": "{target.python}"}}}}'
+            )
+    return gaps
 
 
 def wheelhouse() -> Path:
@@ -498,13 +526,17 @@ def read_bundle(path: Path, into: Path) -> List[Tuple[Path, str]]:
 
 
 def cmd_targets(args) -> int:
-    for target in find_targets(args.target):
+    targets = find_targets(args.target)
+    for target in targets:
         requirements = target.path / "requirements.txt"
         print(
             f"{target.name:28} python {target.python:5} {target.os:8} {target.arch:8} "
             f"platforms={target.platforms[0]}{f' (+{len(target.platforms) - 1} older)' if len(target.platforms) > 1 else ''} "
             f"requirements={len(read_lines(requirements)) if requirements.is_file() else 0}"
         )
+    gaps = renovate_gaps(targets)
+    if gaps:
+        raise MirrorError("\n".join(gaps))
     return 0
 
 
