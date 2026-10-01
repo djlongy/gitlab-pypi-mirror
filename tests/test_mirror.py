@@ -205,6 +205,24 @@ class TargetTests(Workspace):
         (target / "platforms.txt").write_text("# RHEL 7\nmanylinux2014_x86_64\n")
         self.assertEqual(mirror.find_targets()[0].platforms, ["manylinux2014_x86_64"])
 
+    def test_renovate_json_must_hold_every_target_to_its_python(self):
+        for name in ("linux-py3.9", "linux-py3.9-aarch64", "windows-py3.12"):
+            (self.packages / name).mkdir()
+        config = self.packages.parent / "renovate.json"
+        rule = {"matchFileNames": ["packages/*-py3.9/**", "packages/*-py3.9-*/**"],
+                "constraints": {"python": "3.9"}}
+        config.write_text(json.dumps({"constraintsFiltering": "strict", "packageRules": [rule]}))
+        gaps = mirror.renovate_gaps(mirror.find_targets())
+        self.assertEqual([g.split(":")[0] for g in gaps], ["windows-py3.12"])
+        with self.assertRaises(mirror.MirrorError), redirect_stdout(io.StringIO()):
+            mirror.cmd_targets(mock.Mock(target=None))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(mirror.cmd_targets(mock.Mock(target=["linux-py3.9"])), 0)
+        config.write_text(json.dumps({"packageRules": [rule]}))
+        self.assertIn("constraintsFiltering", mirror.renovate_gaps([])[0])
+        config.unlink()
+        self.assertEqual(mirror.renovate_gaps(mirror.find_targets()), [])
+
     def test_a_misnamed_directory_is_refused(self):
         for bad in ("py3.12-linux", "linux-3.12", "macos-py3.12", "linux-py3.12-sparc"):
             with self.subTest(bad):

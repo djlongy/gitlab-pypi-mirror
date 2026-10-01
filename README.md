@@ -37,6 +37,11 @@ or build one elsewhere and add it to `wheelhouse/`.
 Optional in a target directory: `platforms.txt`, pip platform tags, one per line,
 replacing the defaults.
 
+Renovate updates `==` pins and opens one MR per Python version. `renovate.json`
+holds one `packageRules` entry per version, which limits that version's targets to
+releases it can install, and `mirror.py targets` (the `test` job) fails when a target
+has no entry and prints the one to add. Unpinned lines take the newest release at download.
+
 Every target downloads into one `wheelhouse/` at the repository root. A wheel's file
 name carries its Python and platform tags, so a pure-Python wheel two targets need is
 stored, downloaded and uploaded once. Wheels in an older `packages/<target>/wheelhouse/`
