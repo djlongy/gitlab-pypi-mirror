@@ -239,13 +239,25 @@ class TargetTests(Workspace):
 
         with mock.patch.object(mirror.subprocess, "run", side_effect=fake_pip) as pip, \
                 redirect_stdout(io.StringIO()):
-            mirror.cmd_pin(mock.Mock(target=None))
+            mirror.cmd_pin(mock.Mock(path=None))
             self.assertEqual(
                 (self.packages / "linux-py3.9" / "requirements.txt").read_text(),
                 "# keep\nrequests==2.31.0\nPyYAML==6.0.2  # yaml\nruamel.yaml[jinja2]==0.18.6\nnumpy>=1.20\n",
             )
-            mirror.cmd_pin(mock.Mock(target=None))
+            mirror.cmd_pin(mock.Mock(path=None))
         self.assertEqual(pip.call_count, 1, "a file with nothing bare is not resolved again")
+
+    def test_pin_takes_folders_and_files_recursively(self):
+        for name in ("linux-py3.9", "linux-py3.12", "windows-py3.12"):
+            self.target(name, "requests\n")
+        names = lambda *paths: [t.name for t in mirror.targets_in([str(self.packages / p) for p in paths])]
+        self.assertEqual(names(""), ["linux-py3.12", "linux-py3.9", "windows-py3.12"])
+        self.assertEqual(names("linux-py3.9"), ["linux-py3.9"])
+        self.assertEqual(names("windows-py3.12/requirements.txt", "windows-py3.12"), ["windows-py3.12"])
+        for bad in ("linux-py3.11", "linux-py3.9/platforms.txt"):
+            with self.subTest(bad), self.assertRaises(mirror.MirrorError):
+                (self.packages / "linux-py3.9" / "platforms.txt").write_text("")
+                names(bad)
 
     def test_a_misnamed_directory_is_refused(self):
         for bad in ("py3.12-linux", "linux-3.12", "macos-py3.12", "linux-py3.12-sparc"):
