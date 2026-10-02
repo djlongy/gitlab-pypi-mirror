@@ -223,6 +223,30 @@ class TargetTests(Workspace):
         config.unlink()
         self.assertEqual(mirror.renovate_gaps(mirror.find_targets()), [])
 
+    def test_pin_writes_a_version_on_bare_names_only(self):
+        self.target("linux-py3.9", "# keep\nrequests==2.31.0\nPyYAML  # yaml\nruamel.yaml[jinja2]\nnumpy>=1.20\n")
+
+        def fake_pip(command, check):
+            self.assertIn("3.9", command)
+            report = Path(command[command.index("--report") + 1])
+            report.write_text(json.dumps({"install": [
+                {"metadata": {"name": "requests", "version": "2.31.0"}, "requested": True},
+                {"metadata": {"name": "PyYAML", "version": "6.0.2"}, "requested": True},
+                {"metadata": {"name": "ruamel-yaml", "version": "0.18.6"}, "requested": True},
+                {"metadata": {"name": "numpy", "version": "2.0.2"}, "requested": True},
+                {"metadata": {"name": "idna", "version": "3.10"}, "requested": False},
+            ]}))
+
+        with mock.patch.object(mirror.subprocess, "run", side_effect=fake_pip) as pip, \
+                redirect_stdout(io.StringIO()):
+            mirror.cmd_pin(mock.Mock(target=None))
+            self.assertEqual(
+                (self.packages / "linux-py3.9" / "requirements.txt").read_text(),
+                "# keep\nrequests==2.31.0\nPyYAML==6.0.2  # yaml\nruamel.yaml[jinja2]==0.18.6\nnumpy>=1.20\n",
+            )
+            mirror.cmd_pin(mock.Mock(target=None))
+        self.assertEqual(pip.call_count, 1, "a file with nothing bare is not resolved again")
+
     def test_a_misnamed_directory_is_refused(self):
         for bad in ("py3.12-linux", "linux-3.12", "macos-py3.12", "linux-py3.12-sparc"):
             with self.subTest(bad):
