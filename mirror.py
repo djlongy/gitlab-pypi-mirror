@@ -583,9 +583,25 @@ def pip_resolve(target: Target, requirements: Path) -> Dict[str, str]:
     return {canonical(i["metadata"]["name"]): i["metadata"]["version"] for i in install if i.get("requested")}
 
 
+def targets_in(paths: List[str]) -> List[Target]:
+    """The targets whose requirements.txt is one of these paths or anywhere under them."""
+    found: Dict[Path, Target] = {}
+    for given in paths:
+        path = Path(given).resolve()
+        if not path.exists():
+            raise MirrorError(f"{given}: no such file or directory")
+        files = sorted(path.rglob("requirements.txt")) if path.is_dir() else [path]
+        if not files or files[0].name != "requirements.txt":
+            raise MirrorError(f"{given}: no requirements.txt here")
+        for file in files:
+            if file.parent not in found:
+                found[file.parent] = Target(file.parent)
+    return list(found.values())
+
+
 def cmd_pin(args) -> int:
     """Pin every bare package name to the newest release this target can install. Pinned lines are left alone."""
-    for target in find_targets(args.target):
+    for target in targets_in(args.path or [str(PACKAGES)]):
         requirements = target.path / "requirements.txt"
         lines = requirements.read_text(encoding="utf-8-sig").splitlines() if requirements.is_file() else []
         bare = [i for i, line in enumerate(lines) if BARE_RE.match(line.strip())]
@@ -732,9 +748,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         ("import", cmd_import, "verify bundles and upload what the registry lacks"),
     ):
         command = sub.add_parser(name, help=text)
-        if name in ("targets", "pin", "download"):
+        if name in ("targets", "download"):
             command.add_argument("--target", action="append", help="limit to this target (repeatable)")
         command.set_defaults(handler=handler)
+        if name == "pin":
+            command.add_argument("path", nargs="*",
+                                 help="a target folder, a requirements.txt, or a folder holding targets (default: packages/)")
         if name == "download":
             command.add_argument("--pip-arg", action="append", help="extra argument for pip download (repeatable)")
         if name in ("publish", "import"):
