@@ -1,2 +1,2 @@
 requests==2.32.5
-pywin32
+pywin32==312

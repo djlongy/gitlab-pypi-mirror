@@ -40,7 +40,10 @@ replacing the defaults.
 Renovate updates `==` pins and opens one MR per Python version. `renovate.json`
 holds one `packageRules` entry per version, which limits that version's targets to
 releases it can install, and `mirror.py targets` (the `test` job) fails when a target
-has no entry and prints the one to add. Unpinned lines take the newest release at download.
+has no entry and prints the one to add. Renovate skips unpinned lines (`invalid-value`),
+and they take the newest release at download. `python3 mirror.py pin [--target <dir>]`
+pins every unpinned line to the newest release that target can install and leaves
+pinned lines alone. Delete a line's `==<version>` to unpin it again.
 
 Every target downloads into one `wheelhouse/` at the repository root. A wheel's file
 name carries its Python and platform tags, so a pure-Python wheel two targets need is

@@ -558,6 +558,50 @@ def pip_download(target: Target, extra: List[str]) -> None:
         subprocess.run(command, check=True)
 
 
+BARE_RE = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)(?P<extras>\[[^\]]*\])?\s*(?P<comment>#.*)?$")
+
+
+def canonical(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def pip_resolve(target: Target, requirements: Path) -> Dict[str, str]:
+    """The version pip would download for each requested package, as {canonical name: version}."""
+    with tempfile.TemporaryDirectory() as tmp:
+        report = Path(tmp) / "report.json"
+        command = [sys.executable, "-m", "pip", "install", "--dry-run", "--ignore-installed", "--quiet",
+                   "--disable-pip-version-check", "--report", str(report), "--target", str(Path(tmp) / "t"),
+                   "-r", str(requirements), "--only-binary=:all:",
+                   "--python-version", target.python, "--implementation", "cp"]
+        for platform in target.platforms:
+            command += ["--platform", platform]
+        try:
+            subprocess.run(command, check=True)
+        except subprocess.CalledProcessError:
+            raise MirrorError(f"{target.name}: pip could not resolve {requirements.relative_to(ROOT)}") from None
+        install = json.loads(report.read_text())["install"]
+    return {canonical(i["metadata"]["name"]): i["metadata"]["version"] for i in install if i.get("requested")}
+
+
+def cmd_pin(args) -> int:
+    """Pin every bare package name to the newest release this target can install. Pinned lines are left alone."""
+    for target in find_targets(args.target):
+        requirements = target.path / "requirements.txt"
+        lines = requirements.read_text(encoding="utf-8-sig").splitlines() if requirements.is_file() else []
+        bare = [i for i, line in enumerate(lines) if BARE_RE.match(line.strip())]
+        if not bare:
+            print(f"{target.name}: nothing to pin")
+            continue
+        versions = pip_resolve(target, requirements)
+        for i in bare:
+            match = BARE_RE.match(lines[i].strip())
+            pin = f"{match['name']}{match['extras'] or ''}=={versions[canonical(match['name'])]}"
+            lines[i] = f"{pin}  {match['comment']}" if match["comment"] else pin
+            print(f"{target.name}: {pin}")
+        requirements.write_text("\n".join(lines) + "\n")
+    return 0
+
+
 def cmd_download(args) -> int:
     failed = []
     adopt_target_wheelhouses()
@@ -680,6 +724,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     for name, handler, text in (
         ("targets", cmd_targets, "list the targets under packages/ and how each is read"),
+        ("pin", cmd_pin, "pin each unpinned requirement to the newest release its target can install"),
         ("download", cmd_download, "pip download every target into wheelhouse/"),
         ("publish", cmd_publish, "upload wheelhouse files the registry does not have"),
         ("prune", cmd_prune, "remove local copies of wheels the registry already has"),
@@ -687,7 +732,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         ("import", cmd_import, "verify bundles and upload what the registry lacks"),
     ):
         command = sub.add_parser(name, help=text)
-        if name in ("targets", "download"):
+        if name in ("targets", "pin", "download"):
             command.add_argument("--target", action="append", help="limit to this target (repeatable)")
         command.set_defaults(handler=handler)
         if name == "download":
