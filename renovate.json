@@ -3,7 +3,13 @@
   "enabledManagers": ["pip_requirements"],
   "constraintsFiltering": "strict",
   "separateMajorMinor": false,
+  "platformAutomerge": true,
   "packageRules": [
+    {
+      "description": "Minor and patch updates merge once the pipeline passes; a group holding a major waits for review",
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true
+    },
     {
       "groupName": "Python 3.9 packages",
       "matchFileNames": ["packages/*-py3.9/**", "packages/*-py3.9-*/**"],

@@ -37,7 +37,9 @@ or build one elsewhere and add it to `wheelhouse/`.
 Optional in a target directory: `platforms.txt`, pip platform tags, one per line,
 replacing the defaults.
 
-Renovate updates `==` pins and opens one MR per Python version. `renovate.json`
+Renovate updates `==` pins and opens one MR per Python version. An MR of minor and patch
+updates merges itself once the pipeline passes; one holding a major waits for review. Give the
+Renovate bot merge rights on the default branch, or GitLab refuses the merge with 401. `renovate.json`
 holds one `packageRules` entry per version, which limits that version's targets to
 releases it can install, and `mirror.py targets` (the `test` job) fails when a target
 has no entry and prints the one to add. Renovate skips unpinned lines (`invalid-value`),
