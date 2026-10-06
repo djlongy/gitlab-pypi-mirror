@@ -565,13 +565,13 @@ def canonical(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def pip_resolve(target: Target, requirements: Path) -> Dict[str, str]:
-    """The version pip would download for each requested package, as {canonical name: version}."""
+def pip_resolve(target: Target, requirements: Path, names: List[str]) -> Dict[str, str]:
+    """The version pip would download for each of these names, as {canonical name: version}."""
+    # pip download, not pip install --dry-run --report: those need pip 22.2, and
+    # EL9's stock pip is 21.3.1. The wheels land in a temporary directory only.
     with tempfile.TemporaryDirectory() as tmp:
-        report = Path(tmp) / "report.json"
-        command = [sys.executable, "-m", "pip", "install", "--dry-run", "--ignore-installed", "--quiet",
-                   "--disable-pip-version-check", "--report", str(report), "--target", str(Path(tmp) / "t"),
-                   "-r", str(requirements), "--only-binary=:all:",
+        command = [sys.executable, "-m", "pip", "download", "--quiet", "--disable-pip-version-check",
+                   "--dest", tmp, "-r", str(requirements), "--only-binary=:all:",
                    "--python-version", target.python, "--implementation", "cp"]
         for platform in target.platforms:
             command += ["--platform", platform]
@@ -579,8 +579,18 @@ def pip_resolve(target: Target, requirements: Path) -> Dict[str, str]:
             subprocess.run(command, check=True)
         except subprocess.CalledProcessError:
             raise MirrorError(f"{target.name}: pip could not resolve {requirements.relative_to(ROOT)}") from None
-        install = json.loads(report.read_text())["install"]
-    return {canonical(i["metadata"]["name"]): i["metadata"]["version"] for i in install if i.get("requested")}
+        found: Dict[str, Set[str]] = {}
+        for wheel in Path(tmp).glob("*.whl"):
+            name, version = name_and_version(wheel.name)
+            found.setdefault(canonical(name), set()).add(version)
+    wanted = {canonical(n) for n in names}
+    missing = sorted(n for n in wanted if n not in found)
+    if missing:
+        raise MirrorError(f"{target.name}: pip downloaded no wheel for {', '.join(missing)}")
+    several = sorted(f"{n} ({', '.join(sorted(found[n]))})" for n in wanted if len(found[n]) > 1)
+    if several:
+        raise MirrorError(f"{target.name}: pip downloaded more than one version of {', '.join(several)}")
+    return {n: found[n].pop() for n in wanted}
 
 
 def targets_in(paths: List[str]) -> List[Target]:
@@ -608,7 +618,7 @@ def cmd_pin(args) -> int:
         if not bare:
             print(f"{target.name}: nothing to pin")
             continue
-        versions = pip_resolve(target, requirements)
+        versions = pip_resolve(target, requirements, [BARE_RE.match(lines[i].strip())["name"] for i in bare])
         for i in bare:
             match = BARE_RE.match(lines[i].strip())
             pin = f"{match['name']}{match['extras'] or ''}=={versions[canonical(match['name'])]}"
