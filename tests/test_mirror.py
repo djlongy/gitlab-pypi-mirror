@@ -223,29 +223,71 @@ class TargetTests(Workspace):
         config.unlink()
         self.assertEqual(mirror.renovate_gaps(mirror.find_targets()), [])
 
+    def fake_pip(self, *wheels: str, returncode: int = 0):
+        """A pip download that drops these wheel names into --dest, recording each command."""
+        commands = []
+
+        def run(command, check):
+            commands.append(command)
+            if returncode:
+                raise subprocess.CalledProcessError(returncode, command)
+            dest = Path(command[command.index("--dest") + 1])
+            for wheel in wheels:
+                (dest / wheel).write_bytes(b"")
+
+        return commands, mock.patch.object(mirror.subprocess, "run", side_effect=run)
+
     def test_pin_writes_a_version_on_bare_names_only(self):
         self.target("linux-py3.9", "# keep\nrequests==2.31.0\nPyYAML  # yaml\nruamel.yaml[jinja2]\nnumpy>=1.20\n")
-
-        def fake_pip(command, check):
-            self.assertIn("3.9", command)
-            report = Path(command[command.index("--report") + 1])
-            report.write_text(json.dumps({"install": [
-                {"metadata": {"name": "requests", "version": "2.31.0"}, "requested": True},
-                {"metadata": {"name": "PyYAML", "version": "6.0.2"}, "requested": True},
-                {"metadata": {"name": "ruamel-yaml", "version": "0.18.6"}, "requested": True},
-                {"metadata": {"name": "numpy", "version": "2.0.2"}, "requested": True},
-                {"metadata": {"name": "idna", "version": "3.10"}, "requested": False},
-            ]}))
-
-        with mock.patch.object(mirror.subprocess, "run", side_effect=fake_pip) as pip, \
-                redirect_stdout(io.StringIO()):
+        commands, pip = self.fake_pip(
+            "requests-2.31.0-py3-none-any.whl", "PyYAML-6.0.2-cp39-cp39-manylinux_2_17_x86_64.whl",
+            "ruamel.yaml-0.18.6-py3-none-any.whl", "numpy-2.0.2-cp39-cp39-manylinux_2_17_x86_64.whl",
+            "idna-3.10-py3-none-any.whl")
+        with pip, redirect_stdout(io.StringIO()):
             mirror.cmd_pin(mock.Mock(path=None))
             self.assertEqual(
                 (self.packages / "linux-py3.9" / "requirements.txt").read_text(),
                 "# keep\nrequests==2.31.0\nPyYAML==6.0.2  # yaml\nruamel.yaml[jinja2]==0.18.6\nnumpy>=1.20\n",
             )
             mirror.cmd_pin(mock.Mock(path=None))
-        self.assertEqual(pip.call_count, 1, "a file with nothing bare is not resolved again")
+        self.assertEqual(len(commands), 1, "a file with nothing bare is not resolved again")
+
+    def test_pin_resolves_with_pip_download_for_the_targets_python(self):
+        """EL9's stock pip 21.3.1 has no install --dry-run or --report."""
+        self.assertNotEqual("%d.%d" % sys.version_info[:2], "3.11", "the target must differ from the host python")
+        self.target("linux-py3.11", "requests[socks]\n")
+        commands, pip = self.fake_pip("requests-2.32.5-py3-none-any.whl", "PySocks-1.7.1-py3-none-any.whl",
+                                      "urllib3-2.5.0-py3-none-any.whl")
+        with pip, redirect_stdout(io.StringIO()):
+            mirror.cmd_pin(mock.Mock(path=None))
+        command = commands[0]
+        self.assertEqual(command[1:4], ["-m", "pip", "download"])
+        for flag in ("--dry-run", "--report", "--target", "install"):
+            self.assertNotIn(flag, command)
+        self.assertNotEqual(mirror.wheelhouse(), Path(command[command.index("--dest") + 1]))
+        self.assertEqual(command[command.index("--python-version") + 1], "3.11")
+        self.assertIn("--only-binary=:all:", command)
+        self.assertIn("--disable-pip-version-check", command)
+        self.assertEqual(command[command.index("--implementation") + 1], "cp")
+        platforms = [command[i + 1] for i, arg in enumerate(command) if arg == "--platform"]
+        self.assertEqual(platforms, mirror.linux_platforms(mirror.MANYLINUX, "x86_64"))
+        self.assertEqual((self.packages / "linux-py3.11" / "requirements.txt").read_text(),
+                         "requests[socks]==2.32.5\n", "dependencies are downloaded but never pinned")
+
+    def test_a_failed_resolution_leaves_requirements_alone(self):
+        self.target("linux-py3.9", "requests\nnumpy\n")
+        before = (self.packages / "linux-py3.9" / "requirements.txt").read_text()
+        for wheels, returncode, message in (((), 1, "could not resolve"),
+                                            (("requests-2.32.5-py3-none-any.whl",), 0, "no wheel for numpy"),
+                                            (("requests-2.32.5-py3-none-any.whl", "requests-2.31.0-py3-none-any.whl",
+                                              "numpy-2.0.2-cp39-cp39-win_amd64.whl"), 0, "more than one version")):
+            with self.subTest(message):
+                _, pip = self.fake_pip(*wheels, returncode=returncode)
+                # targets_in() resolves paths, and the error names the file relative to ROOT.
+                with pip, mock.patch.object(mirror, "ROOT", mirror.ROOT.resolve()), \
+                        self.assertRaisesRegex(mirror.MirrorError, message):
+                    mirror.cmd_pin(mock.Mock(path=None))
+                self.assertEqual((self.packages / "linux-py3.9" / "requirements.txt").read_text(), before)
 
     def test_pin_takes_folders_and_files_recursively(self):
         for name in ("linux-py3.9", "linux-py3.12", "windows-py3.12"):
