@@ -125,6 +125,12 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
   and writes the same tar to local disk to carry across by hand. It needs free space for
   twice the bundle, and a token with `read_api`:
   `GITLAB_API_URL=https://gitlab.example.com/api/v4 PYPI_PROJECT=platform/pypi-mirror PYPI_TOKEN=$TOKEN EXPORT_SINCE=2025-09-01 python3 mirror.py export --bundle bundle`
+- To resend one package the high side is missing, export it by name instead of by date. A
+  manual export is fresh: it takes what the registry holds, whatever was sent before.
+  `--target` keeps only the wheels that target's Python and platform can install, and a
+  version is optional. Dependencies are not added; name each one that is also missing.
+  `PYPI_TOKEN=$TOKEN python3 mirror.py export --package numpy==2.3.4 --target linux-py3.12 --bundle /share/out`
+  On the high side, `python3 mirror.py import /media/usb/pypi-pick-*.tar` uploads it.
 - With `NIFI_URL` set, `sync` and `export` also POST each bundle, with the headers
   `Filename`, `X-Sha256`, `X-Artifact-Type: python-packages`, `X-Artifact-Format: tar`,
   `X-Artifact-Action: mirror` and `X-Bundle-Kind`

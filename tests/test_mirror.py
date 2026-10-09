@@ -18,7 +18,7 @@ import threading
 import unittest
 import urllib.parse
 import zipfile
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest import mock
@@ -101,7 +101,9 @@ class FakeGitLab(BaseHTTPRequestHandler):
                      "created_at": f.get("_created", "2026-09-01T00:00:00Z")}
                     for n, f in self.files[names[pid]].items()]
         else:
-            body = [{"id": i, "name": n} for i, n in enumerate(names)]
+            # One package per name here; GitLab has one per name and version.
+            body = [{"id": i, "name": n, "version": next((f.get("version", "") for f in self.files[n].values()), "")}
+                    for i, n in enumerate(names)]
         self.send_response(200)
         self.end_headers()
         self.wfile.write(json.dumps(body).encode())
@@ -681,6 +683,44 @@ class BundleTests(FakeRegistry):
         with tarfile.open(bundle) as tar:
             self.assertIn("wheels/certifi-2026.7.22-py3-none-any.whl", tar.getnames())
             self.assertNotIn("wheels/idna-3.20-py3-none-any.whl", tar.getnames())
+
+
+    def test_export_one_package_for_one_python_version(self):
+        os.environ["PYPI_TOKEN"], os.environ["PYPI_USERNAME"] = TOKEN, "gitlab-ci-token-as-pat"
+        wheelhouse = self.target("linux-py3.12")
+        self.target("windows-py3.12")
+        for name in ("numpy-2.3.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+                     "numpy-2.3.4-cp312-cp312-win_amd64.whl", "numpy-2.3.4-cp311-cp311-win_amd64.whl",
+                     "idna-3.20-py3-none-any.whl"):
+            make_wheel(wheelhouse, name)
+        self.run_cli("publish")
+        out_dir = Path(self.tmp.name) / "pick"
+        code, out = self.run_cli("export", "--package", "numpy==2.3.4", "--target", "windows-py3.12",
+                                 "--bundle", str(out_dir))
+        self.assertEqual(code, 0, out)
+        [bundle] = self.bundles(out_dir)
+        with tarfile.open(bundle) as tar:
+            self.assertEqual(sorted(n for n in tar.getnames() if n.startswith("wheels/")),
+                             ["wheels/numpy-2.3.4-cp312-cp312-win_amd64.whl"])
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code, _ = self.run_cli("export", "--package", "numpy==9.9", "--bundle", str(out_dir))
+        self.assertEqual(code, 1)
+        self.assertIn("holds no wheel of numpy==9.9", err.getvalue())
+
+    def test_wheel_fits_reads_python_abi3_and_platform_tags(self):
+        (self.packages / "linux-py3.12").mkdir()
+        [linux] = mirror.find_targets()
+        fits = lambda name: mirror.wheel_fits(name, linux)  # noqa: E731
+        self.assertTrue(fits("idna-3.20-py3-none-any.whl"))
+        self.assertTrue(fits("cryptography-46.0.1-cp311-abi3-manylinux_2_28_x86_64.whl"))
+        self.assertFalse(fits("cryptography-46.0.1-cp313-abi3-manylinux_2_28_x86_64.whl"))
+        self.assertFalse(fits("numpy-2.3.4-cp312-cp312-win_amd64.whl"))
+        self.assertFalse(fits("numpy-2.3.4-cp311-cp311-manylinux_2_28_x86_64.whl"))
+        self.assertFalse(fits("numpy-2.3.4-cp312-cp312t-manylinux_2_28_x86_64.whl"))  # free-threaded
+        self.assertTrue(fits("tool-1.0-cp312-cp312-linux_x86_64.whl"))
+        self.assertEqual(mirror.canonical_version("2.3.4.0"), mirror.canonical_version("2.3.04"))
+        self.assertNotEqual(mirror.canonical_version("2.3.4"), mirror.canonical_version("2.3.4.post1"))
 
 
 if __name__ == "__main__":
