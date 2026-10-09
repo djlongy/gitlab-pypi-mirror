@@ -15,5 +15,6 @@
 You know it works when the `sync` log ends with `bundle: delta/pypi-delta-...tar (N file(s), ...)` and the high-side import reports `N uploaded` and writes each target's `requirements.txt` under `packages/`.
 
 If it fails:
+- One package is missing on the high side for one Python version: `PYPI_TOKEN=<read_api token> python3 mirror.py export --package numpy==2.3.4 --target linux-py3.12 --bundle /share/out` (with `GITLAB_API_URL` and `PYPI_PROJECT` set), carry the tar and its `.sha256`, then `python3 mirror.py import <tar>` on the high side. Name any missing dependency too.
 - A bundle expired before it crossed: add a masked `EXPORT_TOKEN` CI variable (project access token, Reporter, `read_api`), run the pipeline with `EXPORT_SINCE` = the first missed day, then import the `export` job's bundle. Too big for an artifact: run the same export locally, `EXPORT_SINCE=<day> python3 mirror.py export` with `GITLAB_API_URL`, `PYPI_PROJECT` and `PYPI_TOKEN` set.
 - `sync` cannot reach PyPI: set the proxy variables in step 3, or add `tags:` for a runner with internet access to the `sync` job.

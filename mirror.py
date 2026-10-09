@@ -329,16 +329,50 @@ class Registry:
             url = f"{self.project_api}/packages?package_type=pypi&per_page=100&page={page}"
             packages = json.loads(self._get(url))
             for package in packages:
-                files_url = f"{self.project_api}/packages/{package['id']}/package_files?per_page=100"
-                for item in json.loads(self._get(files_url)):
+                for item in self._files_of(package["id"]):
                     if item["created_at"][:10] >= since and item["file_name"].endswith(".whl"):
                         found.append({"file": item["file_name"], "sha256": item["file_sha256"]})
             if len(packages) < 100:
                 return sorted(found, key=lambda f: f["file"])
             page += 1
 
+    def _files_of(self, package_id) -> List[dict]:
+        """Every file of one package, across pages."""
+        found, page = [], 1
+        while True:
+            batch = json.loads(self._get(f"{self.project_api}/packages/{package_id}/package_files?per_page=100&page={page}"))
+            found += batch
+            if len(batch) < 100:
+                return found
+            page += 1
+
+    def package_files(self, name: str, version: Optional[str] = None) -> List[Dict[str, str]]:
+        """Every wheel the registry holds for one package, or one version of it, from the packages API."""
+        if self.job_token:
+            raise MirrorError("export lists packages through the packages API, which a CI job token cannot read: "
+                              "set PYPI_TOKEN or EXPORT_TOKEN to a token with read_api")
+        found, page, key = [], 1, normalize(name)
+        # package_name is a substring match on the name as uploaded, whose separators may differ
+        # (my_pkg, My.Pkg): ask for its longest separator-free part, then compare normalized names.
+        probe = max(re.split(r"[-_.]+", key), key=len)
+        while True:
+            url = (f"{self.project_api}/packages?package_type=pypi&per_page=100&page={page}"
+                   f"&package_name={urllib.parse.quote(probe)}")
+            packages = json.loads(self._get(url))
+            for package in packages:
+                if normalize(package["name"]) != key or (
+                        version and canonical_version(package["version"]) != canonical_version(version)):
+                    continue
+                found += [{"file": item["file_name"], "sha256": item["file_sha256"]}
+                          for item in self._files_of(package["id"]) if item["file_name"].endswith(".whl")]
+            if len(packages) < 100:
+                return sorted(found, key=lambda f: f["file"])
+            page += 1
+
     def download(self, filename: str, sha256: str, dest: Path) -> Path:
         """Stream one file to disk, so a multi-GB wheel never sits in memory."""
+        if Path(filename).name != filename or filename in (".", ".."):
+            raise MirrorError(f"refusing a registry file name with a path in it: {filename!r}")
         path, digest = dest / filename, hashlib.sha256()
         url = f"{self.base}/files/{sha256}/{urllib.parse.quote(filename)}"
         try:
@@ -675,19 +709,74 @@ def cmd_publish(args) -> int:
     return 0
 
 
+def canonical_version(version: str) -> str:
+    """A PEP 440 version in one spelling, so 2.3.4, 2.3.4.0 and 2.3.04 compare equal."""
+    match = re.fullmatch(r"v?(\d+(?:\.\d+)*)(.*)", version.strip().lower())
+    if not match:
+        return version.strip().lower()
+    release = [int(part) for part in match[1].split(".")]
+    while len(release) > 1 and release[-1] == 0:
+        release.pop()
+    return ".".join(map(str, release)) + re.sub(r"[-_.]", "", match[2])
+
+
+def wheel_fits(filename: str, target: "Target") -> bool:
+    """Whether pip on this target's Python and platform could install the wheel, from its file name tags."""
+    parts = filename[:-len(".whl")].split("-")
+    if len(parts) < 5:
+        return False
+    pythons, abis, plats = (set(part.split(".")) for part in parts[-3:])
+    major, minor = target.python.split(".")
+    if not plats & (set(target.platforms) | {"any", f"{target.os}_{target.arch}"}):
+        return False
+    if pythons & {f"py{major}", f"py{major}{minor}"}:
+        return True
+    if f"cp{major}{minor}" in pythons and abis & {f"cp{major}{minor}", "none", "abi3"}:
+        return True  # not cp312t (free-threaded) or cp312d (debug), which a regular build cannot load
+    # abi3 wheels built for an older CPython 3 install on newer ones.
+    return "abi3" in abis and any(re.fullmatch(rf"cp{major}(\d+)", tag) and int(tag[3:]) <= int(minor)
+                                  for tag in pythons)
+
+
 def cmd_export(args) -> int:
-    if not args.since:
-        raise MirrorError("export needs --since YYYY-MM-DD or EXPORT_SINCE")
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.since):
+    if not (args.since or args.package):
+        raise MirrorError("export needs --since YYYY-MM-DD (or EXPORT_SINCE), or --package NAME[==VERSION]")
+    if args.since and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.since):
         raise MirrorError(f"--since {args.since!r}: expected YYYY-MM-DD")
     registry = Registry.from_env()
-    wanted = registry.files_since(args.since)
-    print(f"{len(wanted)} file(s) received since {args.since}")
-    with tempfile.TemporaryDirectory() as tmp:
+    targets = find_targets(args.target) if args.target else []
+    if args.package:
+        # One package by hand, fresh: what the registry holds, whatever was sent before.
+        wanted = []
+        for spec in args.package:
+            match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)(?:==([A-Za-z0-9._+!-]+))?", spec.strip())
+            if not match:
+                raise MirrorError(f"--package {spec!r}: expected NAME or NAME==VERSION")
+            name, version = match[1], match[2]
+            files = registry.package_files(name, version)
+            if targets:
+                files = [f for f in files if any(wheel_fits(f["file"], t) for t in targets)]
+            if not files:
+                raise MirrorError(f"the registry holds no wheel of {spec}"
+                                  + (f" for {', '.join(t.name for t in targets)}" if targets else ""))
+            wanted += files
+        kind = "pick"
+        print(f"{len(wanted)} file(s) for {', '.join(args.package)}"
+              + (f" on {', '.join(t.name for t in targets)}" if targets else ""))
+    else:
+        wanted = registry.files_since(args.since)
+        if targets:
+            wanted = [f for f in wanted if any(wheel_fits(f["file"], t) for t in targets)]
+        kind = f"since-{args.since}"
+        print(f"{len(wanted)} file(s) received since {args.since}"
+              + (f" for {', '.join(t.name for t in targets)}" if targets else ""))
+    wanted = list({f["file"]: f for f in wanted}.values())  # a wheel named twice is carried once
+    Path(args.bundle).mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=args.bundle, prefix=".download-") as tmp:  # beside the bundle, not /tmp
         paths = [registry.download(f["file"], f["sha256"], Path(tmp)) for f in wanted]
-        bundle = write_bundle(paths, Path(args.bundle), f"since-{args.since}", *extras())
+        bundle = write_bundle(paths, Path(args.bundle), kind, *extras())
     if args.post:
-        post_bundle(bundle, args.post, f"since-{args.since}")
+        post_bundle(bundle, args.post, kind)
     return 0
 
 
@@ -758,7 +847,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         ("import", cmd_import, "verify bundles and upload what the registry lacks"),
     ):
         command = sub.add_parser(name, help=text)
-        if name in ("targets", "download"):
+        if name in ("targets", "download", "export"):
             command.add_argument("--target", action="append", help="limit to this target (repeatable)")
         command.set_defaults(handler=handler)
         if name == "pin":
@@ -777,6 +866,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             command.add_argument("--since", default=os.environ.get("EXPORT_SINCE") or None,
                                  help="YYYY-MM-DD, first day to include (default: $EXPORT_SINCE)")
             command.add_argument("--bundle", metavar="DIR", default="bundle", help="directory for the tar (default: bundle)")
+            command.add_argument("--package", action="append", metavar="NAME[==VERSION]",
+                                 help="export this package's wheels instead of a date range (repeatable); with "
+                                      "--target, only the wheels that target can install. Dependencies are not added")
         if name == "import":
             command.add_argument("bundle", nargs="*", help="pypi-*.tar written by publish --bundle or export, oldest first")
             command.add_argument("--inbox", metavar="DIR",
