@@ -1,7 +1,7 @@
 # NiFi: publish each wheel straight to GitLab
 
 `nifi/pypi-to-gitlab.json` is a NiFi 2.x flow that receives a bundle from
-`mirror.py publish` or `export` (`NIFI_URL`), checks it, unpacks the wheels and
+`mirror.py publish` or `export` (`MIRROR_NIFI_URL`), checks it, unpacks the wheels and
 uploads each one to a GitLab PyPI registry. It uses native processors only: no
 scripts. Tested on NiFi 2.11.0 against GitLab 18.9, then installed with pip.
 
@@ -27,8 +27,8 @@ Tar layout (plain tar, not compressed):
 ```text
 MANIFEST.json                                 created, kind, source, commit, files[{file, sha256, size}], requirements[]
 wheels/<name>-<version>-<tags>.whl            one per wheel
-requirements/<target>/requirements.txt        and platforms.txt, when BUNDLE_REQUIREMENTS is on
-repo.bundle                                   only when BUNDLE_GIT is on
+requirements/<target>/requirements.txt        and platforms.txt, when MIRROR_BUNDLE_REQUIREMENTS is on
+repo.bundle                                   only when MIRROR_BUNDLE_GIT is on
 ```
 
 ## What GitLab needs
@@ -83,8 +83,8 @@ Parameters: `gitlab.pypi.url`, `gitlab.username` (`__token__`, any value works),
 5. Start every processor except **Uploaded** and **Rejected (inspect queue)**. Leaving
    those two stopped keeps their queues as a record; start **Uploaded** to drain it.
 6. On the low side, point the mirror at the listener:
-   `NIFI_URL=http://<nifi>:<listen.port>/contentListener`, then run `publish`, or run
-   `export --bundle bundle` to resend history.
+   `MIRROR_NIFI_URL=http://<nifi>:<listen.port>/contentListener`, then run `publish -t bundle`, or run
+   `export --since YYYY-MM-DD -t bundle` to resend history.
 7. Check: every wheel reaches **Uploaded**, and
    `pip install --index-url https://__token__:<token>@<gitlab>/api/v4/projects/<id>/packages/pypi/simple <package>`
    works.

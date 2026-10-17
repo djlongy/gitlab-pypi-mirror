@@ -4,30 +4,52 @@
 # curl but no Python. Needs: curl, unzip, sha256sum (busybox has all three).
 #
 #   sh publish.sh             upload what is missing
-#   sh publish.sh --dry-run   list what would be uploaded
+#   sh publish.sh -n          print "would upload FILE" for what is missing, upload nothing
+#   sh publish.sh -q          no progress on stderr; warnings and errors stay
+#
+# Progress goes to stderr and "would upload" lines to stdout, as mirror.py does.
+# Exit 0 on success, 1 on a failure, 2 on a bad argument.
 #
 # Environment: the same as mirror.py. In CI nothing is needed; elsewhere set
-# GITLAB_API_URL, PYPI_PROJECT and PYPI_TOKEN (PYPI_USERNAME, default __token__).
-# CA_BUNDLE is the CA file to trust for the GitLab API. It replaces the system
+# MIRROR_GITLAB_API_URL, MIRROR_PROJECT and MIRROR_TOKEN (MIRROR_USERNAME, default __token__).
+# MIRROR_CA_BUNDLE is the CA file to trust for the GitLab API. It replaces the system
 # store, so it must hold the whole chain GitLab's certificate needs.
 set -eu
 
+prog=${0##*/}
 dry_run=0
-[ "${1:-}" = "--dry-run" ] && dry_run=1
+quiet=0
 
-api=${GITLAB_API_URL:-${CI_API_V4_URL:-}}
-project=${PYPI_PROJECT:-${CI_PROJECT_ID:-}}
-user=${PYPI_USERNAME:-__token__}
-token=${PYPI_TOKEN:-}
+usage() {
+  echo "usage: $prog [-n|--dry-run] [-q|--quiet] [-h|--help]"
+}
+progress() { [ "$quiet" = 1 ] || echo "$*" >&2; }
+warn() { echo "$prog: warning: $*" >&2; }
+fail() { echo "$prog: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) dry_run=1 ;;
+    -q|--quiet) quiet=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "$prog: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+api=${MIRROR_GITLAB_API_URL:-${CI_API_V4_URL:-}}
+project=${MIRROR_PROJECT:-${CI_PROJECT_ID:-}}
+user=${MIRROR_USERNAME:-__token__}
+token=${MIRROR_TOKEN:-}
 if [ -z "$token" ] && [ -n "${CI_JOB_TOKEN:-}" ]; then
   token=$CI_JOB_TOKEN
   user=gitlab-ci-token
 fi
-[ -n "$api" ] || { echo "ERROR: set GITLAB_API_URL (or run in CI)" >&2; exit 1; }
-[ -n "$project" ] || { echo "ERROR: set PYPI_PROJECT (or run in CI)" >&2; exit 1; }
-[ -n "$token" ] || { echo "ERROR: set PYPI_TOKEN (or run in CI)" >&2; exit 1; }
+[ -n "$api" ] || fail "set MIRROR_GITLAB_API_URL (or run in CI)"
+[ -n "$project" ] || fail "set MIRROR_PROJECT (or run in CI)"
+[ -n "$token" ] || fail "set MIRROR_TOKEN (or run in CI)"
 for tool in curl unzip sha256sum; do
-  command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: $tool is not installed" >&2; exit 1; }
+  command -v "$tool" >/dev/null 2>&1 || fail "$tool is not installed"
 done
 
 # A project path goes in the URL encoded; a numeric id as it is.
@@ -35,12 +57,12 @@ case "$project" in
   *[!0-9]*) project=$(printf '%s' "$project" | sed 's|/|%2F|g') ;;
 esac
 base="${api%/}/projects/$project/packages/pypi"
-wheelhouse=${WHEELHOUSE_DIR:-$(cd "$(dirname "$0")" && pwd)/wheelhouse}
+wheelhouse=${MIRROR_WHEELHOUSE_DIR:-$(cd "$(dirname "$0")" && pwd)/wheelhouse}
 
 # The token goes to curl on stdin as a config line, never on the command line.
 curl_auth() {
-  if [ -n "${CA_BUNDLE:-}" ]; then
-    set -- --cacert "$CA_BUNDLE" "$@"
+  if [ -n "${MIRROR_CA_BUNDLE:-}" ]; then
+    set -- --cacert "$MIRROR_CA_BUNDLE" "$@"
   fi
   printf 'user = "%s:%s"\n' "$user" "$token" | curl --silent --show-error --config - "$@"
 }
@@ -54,12 +76,10 @@ for path in "$wheelhouse"/*; do
   file=${path##*/}
   case "$file" in
     *.whl) ;;
-    *) echo "WARNING: ignoring wheelhouse/$file: only wheels are published" >&2; continue ;;
+    *) warn "ignoring wheelhouse/$file: only wheels are published"; continue ;;
   esac
   if head -c 40 "$path" | grep -q '^version https://git-lfs'; then
-    echo "ERROR: $file is a Git LFS pointer, not a wheel. Install git-lfs where this runs," >&2
-    echo "       or delete .gitattributes and commit the wheels as ordinary files." >&2
-    exit 1
+    fail "$file is a Git LFS pointer, not a wheel. Install git-lfs where this runs, or delete .gitattributes and commit the wheels as ordinary files"
   fi
   total=$((total + 1))
 
@@ -81,7 +101,7 @@ for path in "$wheelhouse"/*; do
     case "$code" in
       200) grep -o '>[^<>]*</a>' "$work/page" | sed 's/^>//; s/<\/a>$//' > "$index" ;;
       404|3??) : > "$index" ;;
-      *) echo "ERROR: GET $base/simple/$key: HTTP $code" >&2; exit 1 ;;
+      *) fail "GET $base/simple/$key: HTTP $code" ;;
     esac
   fi
   if grep -qxF "$file" "$index"; then
@@ -108,17 +128,17 @@ for path in "$wheelhouse"/*; do
   code=$(curl_auth --output "$work/reply" --write-out '%{http_code}' \
     "$@" --form "content=@$path" "$base") || code=000
   case "$code" in
-    20?) echo "uploaded $file"; uploaded=$((uploaded + 1)); echo "$file" >> "$index" ;;
+    20?) progress "uploaded $file"; uploaded=$((uploaded + 1)); echo "$file" >> "$index" ;;
     400|409)
       if grep -qi taken "$work/reply"; then
         skipped=$((skipped + 1))  # uploaded by a concurrent run
       else
-        echo "ERROR: upload $file: HTTP $code: $(head -c 300 "$work/reply")" >&2; exit 1
+        fail "upload $file: HTTP $code: $(head -c 300 "$work/reply")"
       fi ;;
-    *) echo "ERROR: upload $file: HTTP $code: $(head -c 300 "$work/reply")" >&2; exit 1 ;;
+    *) fail "upload $file: HTTP $code: $(head -c 300 "$work/reply")" ;;
   esac
 done
 
 verb=uploaded
 [ "$dry_run" = 1 ] && verb="to upload"
-echo "$total file(s): $uploaded $verb, $skipped already in the registry"
+progress "$total file(s): $uploaded $verb, $skipped already in the registry"

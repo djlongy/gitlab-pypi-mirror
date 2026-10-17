@@ -218,7 +218,7 @@ destination, tick exactly the listed relationship(s) on the **Details** tab, and
    shows up as a deletable row, even though the processor still reports valid.
 3. Select everything except **Rejected (inspect queue)**, right-click > **Start**.
 4. From the low side, send a bundle:
-   `NIFI_URL=http://<nifi>:9090/contentListener python3 mirror.py publish --bundle bundle`
+   `MIRROR_NIFI_URL=http://<nifi>:9090/contentListener python3 mirror.py publish -t bundle`
 5. Watch the queues: wheels arrive in front of **Uploaded**; nothing should reach
    **Rejected (inspect queue)**.
 6. Install from GitLab to prove it:

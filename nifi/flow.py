@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Build the NiFi flow that carries pypi-*.tar bundles across a one-way link, and start it. Stdlib only.
 
-usage: flow.py --side low|high [--url https://nifi:8443] [--user admin] [--password ...]
+usage: flow.py --side low|high [--url https://nifi:8443] [--user admin] [--password-stdin]
                [--param pypi.port=9099] [--param pypi.dest=/dir] [--insecure] [--export FILE]
 
-low:  ListenHTTP :#{pypi.port}/contentListener  (the sync job POSTs each bundle here, NIFI_URL)
+low:  ListenHTTP :#{pypi.port}/contentListener  (the sync job POSTs each bundle here, MIRROR_NIFI_URL)
         -> PutFile #{pypi.dest}                  (the diode's ingress directory)
 high: ListFile #{pypi.source}                    (the diode's egress directory)
         -> FetchFile                             (moves the original to #{pypi.source}/sent)
-        -> PutFile #{pypi.dest}                  (the inbox `mirror.py import --inbox` reads)
+        -> PutFile #{pypi.dest}                  (the inbox directory `mirror.py import DIR` reads)
+
+The NiFi password comes from the first line of stdin with --password-stdin, else from NIFI_PASSWORD;
+it is never an argument, so it stays out of the process list and the shell history.
 
 The bundle crosses byte for byte; `mirror.py import` verifies it. PutFile fails on a name
 conflict, so a re-sent bundle never overwrites silently. Failures loop back with NiFi's penalty,
@@ -120,20 +123,21 @@ def build(n, side, params):
     return pg
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0], allow_abbrev=False)
     ap.add_argument("--side", choices=("low", "high"), required=True)
     ap.add_argument("--url", default=os.environ.get("NIFI_API_URL", "https://localhost:8443"))
     ap.add_argument("--user", default=os.environ.get("NIFI_USER", "admin"))
-    ap.add_argument("--password", default=os.environ.get("NIFI_PASSWORD"))
+    ap.add_argument("--password-stdin", action="store_true", help="read the password from the first line of stdin (else NIFI_PASSWORD)")
     ap.add_argument("--param", action="append", default=[], help="pypi.port=, pypi.source= or pypi.dest=")
     ap.add_argument("--insecure", action="store_true", help="skip TLS verification (self-signed NiFi)")
     ap.add_argument("--export", help="also write the group's flow definition to this file")
-    args = ap.parse_args()
-    if not args.password:
-        raise SystemExit("set --password or NIFI_PASSWORD")
+    args = ap.parse_args(argv)
+    password = sys.stdin.readline().rstrip("\r\n") if args.password_stdin else os.environ.get("NIFI_PASSWORD", "")
+    if not password:
+        ap.error("the password is empty: pipe it to --password-stdin, or set NIFI_PASSWORD")
     params = dict(DEFAULTS[args.side], **dict(p.split("=", 1) for p in args.param))
-    n = Nifi(args.url, args.user, args.password, not args.insecure)
+    n = Nifi(args.url, args.user, password, not args.insecure)
     n.login()
     pg = build(n, args.side, params)
     print(f"pypi {args.side} side running in process group {pg}: {params}")

@@ -5,7 +5,7 @@
 # downloads from PyPI inside the job, publishes, and keeps only the files this
 # run uploaded as a short-lived artifact for the high side. That job needs a
 # runner that reaches PyPI, directly or through HTTPS_PROXY. Run pipeline with
-# EXPORT_SINCE=YYYY-MM-DD rebuilds a bundle from the registry after a missed one.
+# MIRROR_EXPORT_SINCE=YYYY-MM-DD rebuilds a bundle from the registry after a missed one.
 #
 # Runs on any executor: a docker runner uses PYTHON_IMAGE, a shell runner uses
 # the host. python3 (3.8+) runs mirror.py; without it, publish.sh does the same
@@ -23,10 +23,10 @@ variables:
   # your internal registry.
   PYTHON_IMAGE: python:3.12-slim
   GIT_DEPTH: "1"
-  # What sync and export bundles carry besides wheels. BUNDLE_GIT needs git in PYTHON_IMAGE.
-  BUNDLE_REQUIREMENTS: "true"
-  BUNDLE_GIT: "false"
-  # Set NIFI_URL (a NiFi ListenHTTP, http(s)://host:port/contentListener) to POST each
+  # What sync and export bundles carry besides wheels. MIRROR_BUNDLE_GIT needs git in PYTHON_IMAGE.
+  MIRROR_BUNDLE_REQUIREMENTS: "true"
+  MIRROR_BUNDLE_GIT: "false"
+  # Set MIRROR_NIFI_URL (a NiFi ListenHTTP, http(s)://host:port/contentListener) to POST each
   # bundle there as well; see nifi/flow.py. Unset, bundles stay artifacts only.
 
 default:
@@ -41,7 +41,7 @@ test:
   script:
     - |
       if command -v python3 >/dev/null 2>&1; then
-        python3 mirror.py targets
+        python3 mirror.py check
         python3 -m unittest discover -s tests
       else
         echo "no python3 here: checking publish.sh syntax only"
@@ -60,7 +60,7 @@ publish:
         sh publish.sh
       fi
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" || $MIRROR_SYNC == "true" || $EXPORT_SINCE
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $MIRROR_SYNC == "true" || $MIRROR_EXPORT_SINCE
       when: never
     # A push that changes packages/ runs sync, which publishes the wheelhouse too.
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
@@ -79,10 +79,10 @@ sync:
   stage: publish
   resource_group: pypi-registry
   variables:
-    GIT_DEPTH: "0"  # BUNDLE_GIT bundles the full history
+    GIT_DEPTH: "0"  # MIRROR_BUNDLE_GIT bundles the full history
   script:
     - python3 mirror.py download
-    - python3 mirror.py publish --bundle delta
+    - python3 mirror.py publish -t delta
   # Keeps the wheelhouse between runs on the same runner, so pip only fetches new files.
   cache:
     key: pypi-wheelhouse
@@ -101,22 +101,22 @@ sync:
       changes:
         - packages/**/*
 
-# Recovery: every file the registry received since EXPORT_SINCE, in one bundle.
+# Recovery: every file the registry received since MIRROR_EXPORT_SINCE, in one bundle.
 export:
   stage: publish
   # Only export reads the packages API, which the job token cannot. EXPORT_TOKEN
-  # (Reporter, read_api) is for this job alone. A project PYPI_TOKEN variable
+  # (Reporter, read_api) is for this job alone. A project MIRROR_TOKEN variable
   # (Developer, api) serves every job instead and takes precedence over this line.
   variables:
-    PYPI_TOKEN: $EXPORT_TOKEN
+    MIRROR_TOKEN: $EXPORT_TOKEN
     GIT_DEPTH: "0"
   script:
-    - python3 mirror.py export --since "$EXPORT_SINCE" --bundle bundle
+    - python3 mirror.py export --since "$MIRROR_EXPORT_SINCE" -t bundle
   artifacts:
-    name: pypi-since-$EXPORT_SINCE
+    name: pypi-since-$MIRROR_EXPORT_SINCE
     when: always
     paths:
       - bundle/
     expire_in: 14 days
   rules:
-    - if: $EXPORT_SINCE
+    - if: $MIRROR_EXPORT_SINCE

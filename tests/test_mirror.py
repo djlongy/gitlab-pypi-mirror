@@ -50,6 +50,7 @@ class FakeGitLab(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):
+        getattr(self.server, "paths", []).append(self.path)
         if "/packages?" in self.path or "/package_files" in self.path or "/packages/pypi/files/" in self.path:
             return self._packages_api()
         if self.path.startswith("/upstream/"):
@@ -120,6 +121,12 @@ class FakeGitLab(BaseHTTPRequestHandler):
             return
         length = int(self.headers["Content-Length"])
         raw = self.rfile.read(length)
+        refusal = getattr(self.server, "upload_refusal", None)
+        if refusal:
+            self.send_response(refusal[0])
+            self.end_headers()
+            self.wfile.write(refusal[1].encode())
+            return
         boundary = self.headers["Content-Type"].split("boundary=")[1].encode()
         fields, filename = {}, None
         for part in raw.split(b"--" + boundary):
@@ -158,15 +165,27 @@ def make_wheel(directory: Path, filename: str, requires_python: str = "") -> Pat
     return path
 
 
+class CliMixin:
+    def run_cli(self, *argv):
+        """main() with both streams captured: returns (exit code, stdout) and leaves stderr in self.err."""
+        out, err = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", write_through=True), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                code = mirror.main(list(argv))
+            except SystemExit as stop:
+                code = stop.code
+        self.err = err.getvalue()
+        self.out_bytes = out.buffer.getvalue()
+        return code, self.out_bytes.decode("utf-8", "replace")
+
+
 class Workspace(unittest.TestCase):
     """A throwaway packages/ tree with mirror.ROOT pointed at it."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
-        # The flags come from the environment at import; a pipeline variable must not leak in.
-        patcher = mock.patch.multiple(mirror, ROOT=root, PACKAGES=root / "packages",
-                                      BUNDLE_REQUIREMENTS=True, BUNDLE_GIT=False)
+        patcher = mock.patch.multiple(mirror, ROOT=root, PACKAGES=root / "packages")
         patcher.start()
         self.addCleanup(patcher.stop)
         self.addCleanup(self.tmp.cleanup)
@@ -182,7 +201,7 @@ class Workspace(unittest.TestCase):
         return path
 
 
-class TargetTests(Workspace):
+class TargetTests(CliMixin, Workspace):
     def test_directory_names_are_read_as_os_python_and_arch(self):
         (self.packages / "linux-py3.12").mkdir()
         (self.packages / "windows-py3.9-arm64").mkdir()
@@ -215,11 +234,11 @@ class TargetTests(Workspace):
                 "constraints": {"python": "3.9"}}
         config.write_text(json.dumps({"constraintsFiltering": "strict", "packageRules": [rule]}))
         gaps = mirror.renovate_gaps(mirror.find_targets())
-        self.assertEqual([g.split(":")[0] for g in gaps], ["windows-py3.12"])
-        with self.assertRaises(mirror.MirrorError), redirect_stdout(io.StringIO()):
-            mirror.cmd_targets(mock.Mock(target=None))
-        with redirect_stdout(io.StringIO()):
-            self.assertEqual(mirror.cmd_targets(mock.Mock(target=["linux-py3.9"])), 0)
+        self.assertEqual([g.split(":")[0] for g in gaps], ["packages/windows-py3.12"])
+        self.assertEqual(self.run_cli("check")[0], 1)
+        self.assertRegex(self.err, rf"^{mirror.prog()}: packages/windows-py3.12: renovate.json gives Python nothing")
+        self.assertEqual(self.run_cli("check", "linux-py3.9"), (0, ""))
+        self.assertEqual(self.err, "")
         config.write_text(json.dumps({"packageRules": [rule]}))
         self.assertIn("constraintsFiltering", mirror.renovate_gaps([])[0])
         config.unlink()
@@ -246,12 +265,12 @@ class TargetTests(Workspace):
             "ruamel.yaml-0.18.6-py3-none-any.whl", "numpy-2.0.2-cp39-cp39-manylinux_2_17_x86_64.whl",
             "idna-3.10-py3-none-any.whl")
         with pip, redirect_stdout(io.StringIO()):
-            mirror.cmd_pin(mock.Mock(path=None))
+            mirror.cmd_pin(mock.Mock(path=None, dry_run=False))
             self.assertEqual(
                 (self.packages / "linux-py3.9" / "requirements.txt").read_text(),
                 "# keep\nrequests==2.31.0\nPyYAML==6.0.2  # yaml\nruamel.yaml[jinja2]==0.18.6\nnumpy>=1.20\n",
             )
-            mirror.cmd_pin(mock.Mock(path=None))
+            mirror.cmd_pin(mock.Mock(path=None, dry_run=False))
         self.assertEqual(len(commands), 1, "a file with nothing bare is not resolved again")
 
     def test_pin_resolves_with_pip_download_for_the_targets_python(self):
@@ -261,7 +280,7 @@ class TargetTests(Workspace):
         commands, pip = self.fake_pip("requests-2.32.5-py3-none-any.whl", "PySocks-1.7.1-py3-none-any.whl",
                                       "urllib3-2.5.0-py3-none-any.whl")
         with pip, redirect_stdout(io.StringIO()):
-            mirror.cmd_pin(mock.Mock(path=None))
+            mirror.cmd_pin(mock.Mock(path=None, dry_run=False))
         command = commands[0]
         self.assertEqual(command[1:4], ["-m", "pip", "download"])
         for flag in ("--dry-run", "--report", "--target", "install"):
@@ -272,7 +291,7 @@ class TargetTests(Workspace):
         self.assertIn("--disable-pip-version-check", command)
         self.assertEqual(command[command.index("--implementation") + 1], "cp")
         platforms = [command[i + 1] for i, arg in enumerate(command) if arg == "--platform"]
-        self.assertEqual(platforms, mirror.linux_platforms(mirror.MANYLINUX, "x86_64"))
+        self.assertEqual(platforms, mirror.linux_platforms(mirror.manylinux(), "x86_64"))
         self.assertEqual((self.packages / "linux-py3.11" / "requirements.txt").read_text(),
                          "requests[socks]==2.32.5\n", "dependencies are downloaded but never pinned")
 
@@ -288,13 +307,16 @@ class TargetTests(Workspace):
                 # targets_in() resolves paths, and the error names the file relative to ROOT.
                 with pip, mock.patch.object(mirror, "ROOT", mirror.ROOT.resolve()), \
                         self.assertRaisesRegex(mirror.MirrorError, message):
-                    mirror.cmd_pin(mock.Mock(path=None))
+                    mirror.cmd_pin(mock.Mock(path=None, dry_run=False))
                 self.assertEqual((self.packages / "linux-py3.9" / "requirements.txt").read_text(), before)
 
     def test_pin_takes_folders_and_files_recursively(self):
         for name in ("linux-py3.9", "linux-py3.12", "windows-py3.12"):
             self.target(name, "requests\n")
-        names = lambda *paths: [t.name for t in mirror.targets_in([str(self.packages / p) for p in paths])]
+
+        def names(*paths):
+            return [t.name for t in mirror.targets_in([str(self.packages / p) for p in paths])]
+
         self.assertEqual(names(""), ["linux-py3.12", "linux-py3.9", "windows-py3.12"])
         self.assertEqual(names("linux-py3.9"), ["linux-py3.9"])
         self.assertEqual(names("windows-py3.12/requirements.txt", "windows-py3.12"), ["windows-py3.12"])
@@ -343,6 +365,7 @@ class FakeRegistry(Workspace):
         self.server = HTTPServer(("127.0.0.1", 0), FakeGitLab)
         self.server.forward = False
         self.server.posted, self.server.post_status, self.server.post_headers = [], 200, []
+        self.server.paths = []
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -356,12 +379,7 @@ class FakeRegistry(Workspace):
         self.addCleanup(patcher.stop)
 
 
-class RegistryTests(FakeRegistry):
-    def run_cli(self, *argv):
-        out = io.StringIO()
-        with redirect_stdout(out):
-            code = mirror.main(list(argv))
-        return code, out.getvalue()
+class RegistryTests(CliMixin, FakeRegistry):
 
     def test_publish_uploads_only_what_is_missing_and_a_rerun_uploads_nothing(self):
         linux = self.target("linux-py3.12")
@@ -376,7 +394,7 @@ class RegistryTests(FakeRegistry):
 
         code, out = self.run_cli("publish")
         self.assertEqual(code, 0, out)
-        self.assertIn("3 file(s): 2 uploaded, 1 already in the registry", out)
+        self.assertIn("3 file(s): 2 uploaded, 1 already in the registry", self.err)
         self.assertEqual(len(list(linux.iterdir())), 3)  # the shared wheel is on disk once
         uploaded = FakeGitLab.files["requests"]["requests-2.32.5-py3-none-any.whl"]
         self.assertEqual(uploaded["name"], "requests")
@@ -387,7 +405,7 @@ class RegistryTests(FakeRegistry):
 
         code, out = self.run_cli("publish")
         self.assertEqual(code, 0, out)
-        self.assertIn("0 uploaded, 3 already in the registry", out)
+        self.assertIn("0 uploaded, 3 already in the registry", self.err)
 
     def test_a_forwarded_lookup_is_not_read_as_the_registrys_own_files(self):
         """GitLab 302s an unknown name to pypi.org. Following it made every
@@ -396,7 +414,7 @@ class RegistryTests(FakeRegistry):
         make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")
         code, out = self.run_cli("publish")
         self.assertEqual(code, 0, out)
-        self.assertIn("1 file(s): 1 uploaded, 0 already in the registry", out)
+        self.assertIn("1 file(s): 1 uploaded, 0 already in the registry", self.err)
 
     def test_a_source_distribution_in_a_wheelhouse_is_never_uploaded(self):
         """Air-gapped hosts have no compiler: an sdist in the registry is a
@@ -404,23 +422,19 @@ class RegistryTests(FakeRegistry):
         wheelhouse = self.target("linux-py3.12")
         make_wheel(wheelhouse, "idna-3.20-py3-none-any.whl")
         (wheelhouse / "pkg-0.1.tar.gz").write_bytes(b"not a wheel")
-        err = io.StringIO()
-        with mock.patch("sys.stderr", err):
-            code, out = self.run_cli("publish")
+        code, out = self.run_cli("publish")
         self.assertEqual(code, 0, out)
-        self.assertIn("1 file(s): 1 uploaded", out)
+        self.assertIn("1 file(s): 1 uploaded", self.err)
         self.assertNotIn("pkg", FakeGitLab.files)
-        self.assertIn("ignoring wheelhouse/pkg-0.1.tar.gz", err.getvalue())
+        self.assertIn("ignoring wheelhouse/pkg-0.1.tar.gz", self.err)
 
     def test_a_git_lfs_pointer_is_named_as_one(self):
         """A runner without git-lfs checks out pointer files under the wheels' names."""
         (self.target("linux-py3.12") / "idna-3.20-py3-none-any.whl").write_text(
             "version https://git-lfs.github.com/spec/v1\noid sha256:" + "0" * 64 + "\nsize 70000\n")
-        err = io.StringIO()
-        with mock.patch("sys.stderr", err):
-            code, _ = self.run_cli("publish")
+        code, _ = self.run_cli("publish")
         self.assertEqual(code, 1)
-        self.assertIn("a Git LFS pointer, not a wheel", err.getvalue())
+        self.assertIn("a Git LFS pointer, not a wheel", self.err)
         self.assertEqual(FakeGitLab.files, {})
 
     def test_dry_run_uploads_nothing(self):
@@ -445,7 +459,7 @@ class RegistryTests(FakeRegistry):
         make_wheel(self.packages / "windows-py3.12" / "wheelhouse", "pywin32-312-cp312-cp312-win_amd64.whl")
         code, out = self.run_cli("publish")
         self.assertEqual(code, 0, out)
-        self.assertIn("2 file(s): 2 uploaded", out)
+        self.assertIn("2 file(s): 2 uploaded", self.err)
         self.assertEqual(sorted(p.name for p in (self.packages.parent / "wheelhouse").iterdir()),
                          ["pywin32-312-cp312-cp312-win_amd64.whl", "requests-2.32.5-py3-none-any.whl"])
         self.assertEqual(list(self.packages.glob("*/wheelhouse")), [])
@@ -470,15 +484,10 @@ class RegistryTests(FakeRegistry):
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(mirror.MirrorError) as caught:
                 mirror.Registry.from_env()
-        self.assertIn("PYPI_TOKEN (or CI_JOB_TOKEN)", str(caught.exception))
+        self.assertIn("MIRROR_TOKEN (or CI_JOB_TOKEN)", str(caught.exception))
 
 
-class BundleTests(FakeRegistry):
-    def run_cli(self, *argv):
-        out = io.StringIO()
-        with redirect_stdout(out):
-            code = mirror.main(list(argv))
-        return code, out.getvalue()
+class BundleTests(CliMixin, FakeRegistry):
 
     def bundles(self, directory):
         return sorted(Path(directory).glob("pypi-*.tar"))
@@ -489,7 +498,7 @@ class BundleTests(FakeRegistry):
         FakeGitLab.files["idna"] = {"idna-3.20-py3-none-any.whl": {}}      # already mirrored and shipped
         make_wheel(wheelhouse, "certifi-2026.7.22-py3-none-any.whl")        # new since the last run
         out_dir = Path(self.tmp.name) / "delta"
-        code, out = self.run_cli("publish", "--bundle", str(out_dir))
+        code, out = self.run_cli("publish", "-t", str(out_dir))
         self.assertEqual(code, 0, out)
         [bundle] = self.bundles(out_dir)
         with tarfile.open(bundle) as tar:
@@ -497,28 +506,28 @@ class BundleTests(FakeRegistry):
                                                       "wheels/certifi-2026.7.22-py3-none-any.whl"])
         sidecar = bundle.with_name(bundle.name + ".sha256").read_text().split()[0]
         self.assertEqual(sidecar, mirror.sha256_file(bundle))
-        code, out = self.run_cli("publish", "--bundle", str(out_dir))   # nothing new: no second bundle
-        self.assertIn("no bundle written", out)
+        code, out = self.run_cli("publish", "-t", str(out_dir))   # nothing new: no second bundle
+        self.assertIn("no bundle written", self.err)
         self.assertEqual(len(self.bundles(out_dir)), 1)
 
     def test_import_uploads_a_bundle_into_an_empty_registry_once(self):
         make_wheel(self.target("linux-py3.12", "certifi\n"), "certifi-2026.7.22-py3-none-any.whl", ">=3.7")
         out_dir = Path(self.tmp.name) / "delta"
-        self.run_cli("publish", "--bundle", str(out_dir))
+        self.run_cli("publish", "-t", str(out_dir))
         FakeGitLab.files = {}                                            # the high side starts empty
         [bundle] = self.bundles(out_dir)
         code, out = self.run_cli("import", str(bundle))
         self.assertEqual(code, 0, out)
-        self.assertIn("1 file(s): 1 uploaded", out)
+        self.assertIn("1 file(s): 1 uploaded", self.err)
         self.assertEqual(FakeGitLab.files["certifi"]["certifi-2026.7.22-py3-none-any.whl"]["requires_python"], ">=3.7")
         code, out = self.run_cli("import", str(bundle))
-        self.assertIn("0 uploaded, 1 already in the registry", out)
+        self.assertIn("0 uploaded, 1 already in the registry", self.err)
 
     def test_import_writes_the_requirements_that_came_with_the_bundle(self):
         make_wheel(self.target("linux-py3.12", "certifi\n"), "certifi-2026.7.22-py3-none-any.whl")
         (self.packages / "linux-py3.12" / "platforms.txt").write_text("manylinux_2_28_x86_64\n")
         out_dir = Path(self.tmp.name) / "delta"
-        self.run_cli("publish", "--bundle", str(out_dir))
+        self.run_cli("publish", "-t", str(out_dir))
         [bundle] = self.bundles(out_dir)
         high = Path(self.tmp.name) / "high"
         code, out = self.run_cli("import", str(bundle), "--requirements", str(high))
@@ -529,34 +538,32 @@ class BundleTests(FakeRegistry):
     def test_a_tampered_bundle_is_refused(self):
         make_wheel(self.target("linux-py3.12"), "certifi-2026.7.22-py3-none-any.whl")
         out_dir = Path(self.tmp.name) / "delta"
-        self.run_cli("publish", "--bundle", str(out_dir))
+        self.run_cli("publish", "-t", str(out_dir))
         [bundle] = self.bundles(out_dir)
         with open(bundle, "ab") as handle:
             handle.write(b"x")
         FakeGitLab.files = {}
-        err = io.StringIO()
-        with mock.patch("sys.stderr", err):
-            code, _ = self.run_cli("import", str(bundle))
+        code, _ = self.run_cli("import", str(bundle))
         self.assertEqual(code, 1)
-        self.assertIn("checksum does not match", err.getvalue())
+        self.assertIn("checksum does not match", self.err)
         self.assertEqual(FakeGitLab.files, {})
 
     def test_a_requirements_change_alone_ships_a_bundle(self):
         make_wheel(self.target("linux-py3.12", "certifi\n"), "certifi-2026.7.22-py3-none-any.whl")
         out_dir = Path(self.tmp.name) / "delta"
-        self.run_cli("publish", "--bundle", str(out_dir))
+        self.run_cli("publish", "-t", str(out_dir))
         (self.packages / "linux-py3.12" / "requirements.txt").write_text("")    # a package dropped, nothing new
-        code, out = self.run_cli("publish", "--bundle", str(out_dir))
+        code, out = self.run_cli("publish", "-t", str(out_dir))
         self.assertEqual(code, 0, out)
-        self.assertIn("(0 file(s)", out)
+        self.assertIn("(0 file(s)", self.err)
         self.assertEqual(len(self.bundles(out_dir)), 2)
 
     def test_with_every_extra_off_a_run_with_nothing_new_writes_nothing(self):
         self.target("linux-py3.12", "certifi\n")
         out_dir = Path(self.tmp.name) / "delta"
-        with mock.patch.object(mirror, "BUNDLE_REQUIREMENTS", False):
-            code, out = self.run_cli("publish", "--bundle", str(out_dir))
-        self.assertIn("no bundle written", out)
+        with mock.patch.dict(os.environ, {"MIRROR_BUNDLE_REQUIREMENTS": "false"}):
+            code, out = self.run_cli("publish", "-t", str(out_dir))
+        self.assertIn("no bundle written", self.err)
         self.assertEqual(self.bundles(out_dir), [])
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
@@ -571,12 +578,12 @@ class BundleTests(FakeRegistry):
         git("add", "packages")
         git("commit", "-qm", "first")
         out_dir = Path(self.tmp.name) / "delta"
-        with mock.patch.object(mirror, "BUNDLE_GIT", True):
-            self.run_cli("publish", "--bundle", str(out_dir))
-            code, out = self.run_cli("publish", "--bundle", str(out_dir))       # same commit: nothing new
-            self.assertIn("no bundle written", out)
+        with mock.patch.dict(os.environ, {"MIRROR_BUNDLE_GIT": "on"}):
+            self.run_cli("publish", "-t", str(out_dir))
+            code, out = self.run_cli("publish", "-t", str(out_dir))       # same commit: nothing new
+            self.assertIn("no bundle written", self.err)
             git("commit", "-q", "--allow-empty", "-m", "second")
-            code, out = self.run_cli("publish", "--bundle", str(out_dir))       # new commit, no new wheels
+            code, out = self.run_cli("publish", "-t", str(out_dir))       # new commit, no new wheels
         self.assertEqual(code, 0, out)
         first, second = self.bundles(out_dir)
         FakeGitLab.files = {}
@@ -595,13 +602,11 @@ class BundleTests(FakeRegistry):
         out_dir = Path(self.tmp.name) / "delta"
         url = f"http://127.0.0.1:{self.server.server_port}/contentListener"
         self.server.post_status = 503                                          # NiFi down
-        err = io.StringIO()
-        with mock.patch("sys.stderr", err):
-            code, _ = self.run_cli("publish", "--bundle", str(out_dir), "--post", url)
+        code, _ = self.run_cli("publish", "-t", str(out_dir), "--nifi-url", url)
         self.assertEqual(code, 1)
-        self.assertIn("HTTP 503", err.getvalue())
+        self.assertIn("HTTP 503", self.err)
         self.server.post_status = 200
-        code, out = self.run_cli("publish", "--bundle", str(out_dir), "--post", url)   # nothing new to upload
+        code, out = self.run_cli("publish", "-t", str(out_dir), "--nifi-url", url)   # nothing new to upload
         self.assertEqual(code, 0, out)
         [bundle] = self.bundles(out_dir)[-1:]
         name, sha256, body = self.server.posted[-1]
@@ -612,7 +617,7 @@ class BundleTests(FakeRegistry):
         make_wheel(self.target("linux-py3.12", "certifi\n"), "certifi-2026.7.22-py3-none-any.whl")
         out_dir = Path(self.tmp.name) / "delta"
         url = f"http://127.0.0.1:{self.server.server_port}/contentListener"
-        code, out = self.run_cli("publish", "--bundle", str(out_dir), "--post", url)
+        code, out = self.run_cli("publish", "-t", str(out_dir), "--nifi-url", url)
         self.assertEqual(code, 0, out)
         sent = self.server.post_headers[-1]
         self.assertEqual(sent["X-Artifact-Type"], "python-packages")
@@ -623,52 +628,29 @@ class BundleTests(FakeRegistry):
         self.assertIn("Filename", sent)
 
     def test_export_reads_its_date_from_export_since(self):
-        os.environ["PYPI_TOKEN"], os.environ["PYPI_USERNAME"] = TOKEN, "gitlab-ci-token-as-pat"
+        os.environ["MIRROR_TOKEN"], os.environ["MIRROR_USERNAME"] = TOKEN, "gitlab-ci-token-as-pat"
         self.server.now = "2026-09-20T10:00:00Z"
         make_wheel(self.target("linux-py3.12"), "certifi-2026.7.22-py3-none-any.whl")
         self.run_cli("publish")
         out_dir = Path(self.tmp.name) / "export"
-        with mock.patch.dict(os.environ, {"EXPORT_SINCE": "2026-09-15"}):
-            code, out = self.run_cli("export", "--bundle", str(out_dir))
+        with mock.patch.dict(os.environ, {"MIRROR_EXPORT_SINCE": "2026-09-15"}):
+            code, out = self.run_cli("export", "-t", str(out_dir))
         self.assertEqual(code, 0, out)
         self.assertEqual([b.name.split("-")[1:3] for b in self.bundles(out_dir)], [["since", "2026"]])
 
-    def test_inbox_imports_oldest_first_and_moves_each_bundle_to_done(self):
-        make_wheel(self.target("linux-py3.12", "certifi\n"), "certifi-2026.7.22-py3-none-any.whl")
-        inbox = Path(self.tmp.name) / "inbox"
-        self.run_cli("publish", "--bundle", str(inbox))
-        (self.packages / "linux-py3.12" / "requirements.txt").write_text("certifi\nidna\n")
-        make_wheel(self.packages.parent / "wheelhouse", "idna-3.20-py3-none-any.whl")
-        self.run_cli("publish", "--bundle", str(inbox))
-        FakeGitLab.files = {}
-        high = Path(self.tmp.name) / "high"
-        code, out = self.run_cli("import", "--inbox", str(inbox), "--requirements", str(high))
-        self.assertEqual(code, 0, out)
-        self.assertIn("2 file(s): 2 uploaded", out)
-        self.assertEqual((high / "linux-py3.12" / "requirements.txt").read_text(), "certifi\nidna\n")  # newest won
-        self.assertEqual(list(inbox.glob("pypi-*")), [])
-        self.assertEqual(len(list((inbox / "done").glob("pypi-*.tar"))), 2)
-        code, out = self.run_cli("import", "--inbox", str(inbox))                    # empty inbox is not an error
-        self.assertEqual(code, 0, out)
-        self.assertIn("0 file(s)", out)
-
     def test_export_names_the_token_it_needs_when_given_a_job_token(self):
-        err = io.StringIO()
-        with mock.patch("sys.stderr", err):
-            code, _ = self.run_cli("export", "--since", "2026-09-15")
+        code, _ = self.run_cli("export", "--since", "2026-09-15")
         self.assertEqual(code, 1)
-        self.assertIn("set PYPI_TOKEN holding a project access token", err.getvalue())
+        self.assertIn("set MIRROR_TOKEN holding a project access token", self.err)
 
     def test_export_in_ci_names_the_ci_variable(self):
         os.environ["GITLAB_CI"] = "true"
-        err = io.StringIO()
-        with mock.patch("sys.stderr", err):
-            code, _ = self.run_cli("export", "--since", "2026-09-15")
+        code, _ = self.run_cli("export", "--since", "2026-09-15")
         self.assertEqual(code, 1)
-        self.assertIn("add a masked CI/CD variable EXPORT_TOKEN", err.getvalue())
+        self.assertIn("add a masked CI/CD variable EXPORT_TOKEN", self.err)
 
     def test_export_rebuilds_a_bundle_of_files_received_since_a_date(self):
-        os.environ["PYPI_TOKEN"], os.environ["PYPI_USERNAME"] = TOKEN, "gitlab-ci-token-as-pat"
+        os.environ["MIRROR_TOKEN"], os.environ["MIRROR_USERNAME"] = TOKEN, "gitlab-ci-token-as-pat"
         wheelhouse = self.target("linux-py3.12")
         self.server.now = "2026-09-01T10:00:00Z"
         make_wheel(wheelhouse, "idna-3.20-py3-none-any.whl")
@@ -677,7 +659,7 @@ class BundleTests(FakeRegistry):
         make_wheel(wheelhouse, "certifi-2026.7.22-py3-none-any.whl")
         self.run_cli("publish")
         out_dir = Path(self.tmp.name) / "export"
-        code, out = self.run_cli("export", "--since", "2026-09-15", "--bundle", str(out_dir))
+        code, out = self.run_cli("export", "--since", "2026-09-15", "-t", str(out_dir))
         self.assertEqual(code, 0, out)
         [bundle] = self.bundles(out_dir)
         with tarfile.open(bundle) as tar:
@@ -686,7 +668,7 @@ class BundleTests(FakeRegistry):
 
 
     def test_export_one_package_for_one_python_version(self):
-        os.environ["PYPI_TOKEN"], os.environ["PYPI_USERNAME"] = TOKEN, "gitlab-ci-token-as-pat"
+        os.environ["MIRROR_TOKEN"], os.environ["MIRROR_USERNAME"] = TOKEN, "gitlab-ci-token-as-pat"
         wheelhouse = self.target("linux-py3.12")
         self.target("windows-py3.12")
         for name in ("numpy-2.3.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
@@ -695,18 +677,16 @@ class BundleTests(FakeRegistry):
             make_wheel(wheelhouse, name)
         self.run_cli("publish")
         out_dir = Path(self.tmp.name) / "pick"
-        code, out = self.run_cli("export", "--package", "numpy==2.3.4", "--target", "windows-py3.12",
-                                 "--bundle", str(out_dir))
+        code, out = self.run_cli("export", "numpy==2.3.4", "--target", "windows-py3.12",
+                                 "-t", str(out_dir))
         self.assertEqual(code, 0, out)
         [bundle] = self.bundles(out_dir)
         with tarfile.open(bundle) as tar:
             self.assertEqual(sorted(n for n in tar.getnames() if n.startswith("wheels/")),
                              ["wheels/numpy-2.3.4-cp312-cp312-win_amd64.whl"])
-        err = io.StringIO()
-        with redirect_stderr(err):
-            code, _ = self.run_cli("export", "--package", "numpy==9.9", "--bundle", str(out_dir))
+        code, _ = self.run_cli("export", "numpy==9.9", "-t", str(out_dir))
         self.assertEqual(code, 1)
-        self.assertIn("holds no wheel of numpy==9.9", err.getvalue())
+        self.assertIn("holds no wheel of numpy==9.9", self.err)
 
     def test_wheel_fits_reads_python_abi3_and_platform_tags(self):
         (self.packages / "linux-py3.12").mkdir()
@@ -734,7 +714,7 @@ class ShellPublishTests(FakeRegistry):
     """publish.sh, the curl fallback, against the same fake registry."""
 
     def run_sh(self, *argv):
-        env = dict(os.environ, WHEELHOUSE_DIR=str(self.packages.parent / "wheelhouse"), PATH=SHELL_PATH)
+        env = dict(os.environ, MIRROR_WHEELHOUSE_DIR=str(self.packages.parent / "wheelhouse"), PATH=SHELL_PATH)
         result = subprocess.run(
             ["sh", str(Path(mirror.__file__).with_name("publish.sh")), *argv],
             env=env, capture_output=True, text=True,
@@ -750,28 +730,28 @@ class ShellPublishTests(FakeRegistry):
         FakeGitLab.files["pywin32"] = {"pywin32-312-cp312-cp312-win_amd64.whl": {}}
         code, out, err = self.run_sh()
         self.assertEqual(code, 0, err)
-        self.assertIn("2 file(s): 1 uploaded, 1 already in the registry", out)
+        self.assertIn("2 file(s): 1 uploaded, 1 already in the registry", err)
         fields = FakeGitLab.files["requests"]["requests-2.32.5-py3-none-any.whl"]
         # A --form value starting with < would make curl read a file of that name.
         self.assertEqual(fields["requires_python"], "<4,>=3.9")
         self.assertEqual(fields["version"], "2.32.5")
         self.assertEqual(len(fields["sha256_digest"]), 64)
         code, out, err = self.run_sh()
-        self.assertIn("0 uploaded, 2 already in the registry", out)
+        self.assertIn("0 uploaded, 2 already in the registry", err)
 
     def test_a_forwarded_lookup_is_not_read_as_the_registrys_own_files(self):
         self.server.forward = True
         make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")
         code, out, err = self.run_sh()
         self.assertEqual(code, 0, err)
-        self.assertIn("1 file(s): 1 uploaded, 0 already in the registry", out)
+        self.assertIn("1 file(s): 1 uploaded, 0 already in the registry", err)
 
     def test_a_source_distribution_is_never_uploaded(self):
         wheelhouse = self.target("linux-py3.12")
         (wheelhouse / "pkg-0.1.tar.gz").write_bytes(b"not a wheel")
         code, out, err = self.run_sh()
         self.assertEqual(code, 0, err)
-        self.assertIn("0 file(s)", out)
+        self.assertIn("0 file(s)", err)
         self.assertIn("ignoring wheelhouse/pkg-0.1.tar.gz", err)
 
     def test_a_git_lfs_pointer_is_never_uploaded(self):

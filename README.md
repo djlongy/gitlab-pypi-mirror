@@ -1,154 +1,137 @@
 # gitlab-pypi-mirror
 
-Mirrors Python packages for chosen OS and Python versions into a GitLab PyPI package registry: `./sync.sh`.
+Moves Python wheels into a GitLab PyPI package registry, one package by hand or the whole set on a schedule: `pypi-mirror export six==1.17.0 --target linux-py3.12 -o six.tar`, carry it, `pypi-mirror import six.tar`.
 
 ## Requirements
 
-- A download machine that reaches PyPI directly or through an HTTP proxy, with
-  Python 3.8+, pip and git. `sync.sh` also needs git-lfs while `.gitattributes`
-  sends wheels to Git LFS.
-- GitLab with the package registry enabled on this project, and Git LFS while
-  `.gitattributes` is present.
-- The scheduled `sync` job commits nothing and needs no git-lfs. A runner without
-  git-lfs checks committed wheels out as pointer files, which `publish` refuses: for
-  that runner, delete `.gitattributes` and commit wheels as ordinary files.
-- A runner of any executor, with `python3` 3.8+ or with `curl`, `unzip` and
-  `sha256sum` (any busybox image). Without Python the pipeline publishes with
-  `publish.sh`. Only the scheduled `sync` job needs PyPI access, and Python with pip.
+- Python 3.8+ for `mirror.py`, standard library only. Put it on your PATH as `pypi-mirror`:
+  `ln -s "$PWD/mirror.py" ~/.local/bin/pypi-mirror`. Run it from a checkout of this repository.
+- GitLab with the package registry enabled on the project, on both sides of an air gap.
+- `export` needs a token with `read_api` (Reporter). `import` and `publish` need `write_registry` (Developer).
+- Download machine: pip, git, and git-lfs while `.gitattributes` is present. Any runner with `python3`, or with `curl`, `unzip` and `sha256sum` for `publish.sh`.
 
-## Targets
+## Export one package by hand
 
-Each directory under `packages/` is one target, named `<os>-py<X.Y>[-<arch>]`, and
-holds a `requirements.txt` in pip syntax. `python3 mirror.py targets` prints how each
-name is read.
+Carry one package, for one Python version, from the low-side registry to the high-side registry.
+The target `linux-py3.12` is the directory `packages/linux-py3.12`; its name says the Python and the platform.
+Dependencies are not added: export each one that is missing too.
 
-| Directory | Downloads wheels for |
-|---|---|
-| `linux-py3.12` | CPython 3.12, Linux x86_64, glibc 2.28 and older (`manylinux_2_28` down to `manylinux1`) |
-| `linux-py3.11-aarch64` | CPython 3.11, Linux aarch64 |
-| `windows-py3.9` | CPython 3.9, Windows x64 (`win_amd64`) |
-| `windows-py3.13-arm64` | CPython 3.13, Windows on Arm |
-
-Only wheels are downloaded and published, for every package and every dependency.
-A package with no wheel for a target fails that target's download, and a non-wheel
-file in `wheelhouse/` is ignored with a warning. Pin a release that has a wheel,
-or build one elsewhere and add it to `wheelhouse/`.
-
-Optional in a target directory: `platforms.txt`, pip platform tags, one per line,
-replacing the defaults.
-
-Renovate updates `==` pins and opens one MR per Python version; a person approves each one.
-`recreateWhen: always` reopens an update whenever its `requirements.txt` still lacks it, even
-after its MR was closed or merged without the change; ignore an update with a `packageRules`
-entry, not by closing its MR. `renovate.json`
-holds one `packageRules` entry per version, which limits that version's targets to
-releases it can install, and `mirror.py targets` (the `test` job) fails when a target
-has no entry and prints the one to add. Renovate skips unpinned lines (`invalid-value`),
-and they take the newest release at download. `python3 mirror.py pin [<path> ...]`
-pins every unpinned line to the newest release that target can install and leaves
-pinned lines alone. Delete a line's `==<version>` to unpin it again.
-
-Every target downloads into one `wheelhouse/` at the repository root. A wheel's file
-name carries its Python and platform tags, so a pure-Python wheel two targets need is
-stored, downloaded and uploaded once. Wheels in an older `packages/<target>/wheelhouse/`
-move there on the next `download` or `publish`.
-
-## Environment
-
-The full set is in the argument parser and `Registry.from_env` in `mirror.py`.
-
-| Req | Name | Default | Purpose |
-|---|---|---|---|
-| Optional | `HTTPS_PROXY`, `HTTP_PROXY` | none | Proxy pip uses to reach PyPI. Put the GitLab host in `NO_PROXY` |
-| Optional | `PIP_INDEX_URL` | pypi.org | A PyPI mirror to download from instead |
-| Optional | `PIP_CERT` | system store | CA bundle pip trusts, for a TLS-inspecting proxy |
-| Optional | `MANYLINUX` | `2_28` | Newest glibc your Linux hosts run, as `2_<minor>` |
-| With `--prune` | `GITLAB_API_URL` | `$CI_API_V4_URL` | `https://gitlab.example.com/api/v4` |
-| With `--prune` | `PYPI_PROJECT` | `$CI_PROJECT_ID` | Project path or id that holds the registry |
-| With `--prune` | `PYPI_TOKEN` | `$CI_JOB_TOKEN` | Token with `read_api`; `write_registry` too to publish from outside CI |
-| Optional | `CA_BUNDLE` | system store | CA file for the GitLab API. Replaces the system store, so it holds the full chain |
-| Optional | `PYTHON_IMAGE` (CI) | `python:3.12-slim` | Job image with Python, or with curl, unzip and sha256sum; point it at your internal registry |
-| Optional | `MIRROR_SYNC` (CI) | unset | `true` on Run pipeline runs the scheduled `sync` job now |
-| Optional | `EXPORT_SINCE` | unset | `YYYY-MM-DD`: `export` bundles every file the registry received since then. On Run pipeline it runs the `export` job, which needs a masked CI variable: `EXPORT_TOKEN` (project access token, Reporter, `read_api`), or one `PYPI_TOKEN` (Developer, `api`) that every job then uses. Locally it is the default for `--since` |
-| Optional | `BUNDLE_REQUIREMENTS` | `true` | Bundles carry each target's `requirements.txt` and `platforms.txt` |
-| Optional | `NIFI_URL` | unset | POST each new bundle here too, e.g. `https://nifi.example.com:9099/contentListener` |
-| When `NIFI_URL` is mutual TLS | `NIFI_CLIENT_CERT`, `NIFI_CLIENT_KEY` | unset | Client certificate and key files; `CA_BUNDLE` verifies the server |
-| Optional | `BUNDLE_GIT` | `false` | Bundles carry the repository's history as a git bundle. Needs git in `PYTHON_IMAGE` |
-
-## Usage
+Low side, with the USB stick mounted at `/media/usb`:
 
 ```bash
-git clone https://gitlab.example.com/platform/pypi-mirror.git
-cd pypi-mirror
+export MIRROR_GITLAB_API_URL=https://gitlab.example.com/api/v4 MIRROR_PROJECT=platform/pypi-mirror
+read -rs MIRROR_TOKEN && export MIRROR_TOKEN
+pypi-mirror export six==1.17.0 --target linux-py3.12 -o /media/usb/six.tar
+```
+
+`/media/usb/six.tar` and `/media/usb/six.tar.sha256` are written. Carry both. High side:
+
+```bash
+export MIRROR_GITLAB_API_URL=https://gitlab.high.example.com/api/v4 MIRROR_PROJECT=platform/pypi-mirror
+read -rs MIRROR_TOKEN && export MIRROR_TOKEN
+(cd /media/usb && sha256sum -c six.tar.sha256)
+pypi-mirror import /media/usb/six.tar
+```
+
+Add `-n` to either command to print the plan and change nothing.
+`-o -` streams the tar to stdout for a pipe: `pypi-mirror export six==1.17.0 -o - | tee carry.tar | sha256sum`.
+
+### Large wheels
+
+The same two commands move a wheel of any size, over 1 GB included. `export` and `import` stream every file in 1 MiB chunks and never hold a wheel in memory. The tar needs free disk for the wheel, and `-o -` builds it in a temporary directory first.
+GitLab refuses a PyPI file over its maximum PyPI package file size (default 5 GB, the `max_pypi_package_file_size` application setting), and a reverse proxy in front of GitLab can refuse a smaller body (nginx `client_max_body_size`). A refusal fails `import` with exit 1 and an error that names the file size and both limits. Raise the limit on the high-side instance and run `import` again: files already imported are skipped.
+
+## Several packages
+
+```bash
+pypi-mirror export numpy==2.3.4 idna --target linux-py3.12 -t /media/usb    # name each package
+pypi-mirror export -T wanted.txt -t /media/usb                             # one NAME[==VERSION] per line, # comments, - is stdin
+pypi-mirror export --since 2026-09-01 -t /media/usb                        # every wheel the registry received since a date
+pypi-mirror import /media/usb                                              # a directory is an inbox: every tar, then removed
+```
+
+`-t DIR` writes `pypi-pick-<UTC time>.tar` (`pypi-since-<date>-...` for `--since`) and its `.sha256` in `DIR`. `import` takes tars oldest first by name and removes each inbox tar and its `.sha256` once imported; `-k` keeps them.
+`--requirements DIR` and `--git-bundle FILE` also write the requirement files and git history a bundle carries.
+
+## Keep a set of packages in sync
+
+Each directory under `packages/` is a target named `<os>-py<X.Y>[-<arch>]` with a pip `requirements.txt`, and an optional `platforms.txt` of pip platform tags.
+
+| Directory | Wheels for |
+|---|---|
+| `linux-py3.12` | CPython 3.12, Linux x86_64, glibc 2.28 and older |
+| `linux-py3.11-aarch64` | CPython 3.11, Linux aarch64 |
+| `windows-py3.9` | CPython 3.9, Windows x64 |
+
+```bash
 echo 'requests==2.32.5' >> packages/linux-py3.12/requirements.txt
 HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
 ```
 
+`sync.sh [TARGET...]` pulls, runs `download` into one `wheelhouse/`, commits and pushes; `--no-push` stops after the commit and `--prune` also runs `prune`.
+Only wheels are mirrored, with every dependency. A package with no wheel for a target fails that target. Renovate updates `==` pins, one MR per Python version, and `pypi-mirror check` (the CI test job) fails when `renovate.json` does not hold a target to its Python. `pypi-mirror pin` pins bare names.
+
+## Run it in a pipeline
+
+A push to `main` that changes `packages/` or `wheelhouse/` runs `publish`: it asks the registry's simple index which files it holds and uploads the rest. `publish` never follows a redirect, so GitLab's forward-to-pypi.org setting cannot make a file look published; turn forwarding off so air-gapped clients fail fast.
+A schedule, or Run pipeline with `MIRROR_SYNC=true`, runs `sync`: it downloads, publishes and writes only the uploaded files to `delta/pypi-delta-<UTC>.tar` with a `.sha256`, kept 14 days. Carry the tar and run `pypi-mirror import delta --requirements packages`.
+After a missed bundle, run the pipeline with `MIRROR_EXPORT_SINCE=YYYY-MM-DD` and a masked `EXPORT_TOKEN` (project access token, Reporter, `read_api`); the `export` job bundles every file received since.
+With `MIRROR_NIFI_URL` set, `sync` and `export` also POST each tar to a NiFi ListenHTTP with the headers `Filename`, `X-Sha256`, `X-Artifact-Type: python-packages`, `X-Artifact-Format: tar`, `X-Artifact-Action: mirror` and `X-Bundle-Kind`. `nifi/flow.py --side low|high` builds the transfer flow (the NiFi password comes from `--password-stdin` or `NIFI_PASSWORD`), and `nifi/pypi-to-gitlab.json` uploads each wheel to GitLab from NiFi. On the high side a timer runs `pypi-mirror import DIR`. Steps are in `nifi/PYPI-TO-GITLAB.md`.
+
+## Commands
+
+Global options go before the command: `--api-url URL`, `--project PATH|ID`, `-q`/`--quiet`, `--version`, `-h`/`--help`. `pypi-mirror COMMAND -h` lists sources, destinations, outputs and checks.
+
+| Command | Operands | Options |
+|---|---|---|
+| `list` | `[TARGET...]` | none |
+| `check` | `[TARGET...]` | none |
+| `pin` | `[PATH...]` (default `packages/`) | `-n`/`--dry-run` |
+| `download` | `[TARGET...]` | none (pip reads `PIP_*`) |
+| `publish` | none | `-t`/`--target-directory DIR`, `--nifi-url URL` (needs `-t`), `-n`/`--dry-run` |
+| `prune` | none | `-n`/`--dry-run` |
+| `export` | `[PACKAGE[==VERSION]...]` | `-T`/`--files-from FILE` (repeatable, `-` is stdin), `--since DATE` (not with packages), `--target NAME` (repeatable), `-t`/`--target-directory DIR` (default `.`) or `-o`/`--output FILE` (`-` is stdout), `--nifi-url URL`, `-n`/`--dry-run` |
+| `import` | `SOURCE...` (a tar, or a directory as inbox) | `-k`/`--keep`, `--requirements DIR`, `--git-bundle FILE`, `-n`/`--dry-run` |
+
+`sync.sh`: `[TARGET...]`, `--no-push`, `--prune`, `-h`/`--help`. `publish.sh`: `-n`/`--dry-run`, `-q`/`--quiet`, `-h`/`--help`.
+Data goes to stdout (`list`, the plan lines of `-n`, each tar path) and progress to stderr, so `tar=$(pypi-mirror export idna -t out)` works.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | A failure: HTTP error, unreadable bundle, checksum mismatch, no such target, a finding from `check` |
+| 2 | A usage error: bad option, missing source, `--since` with packages, `--nifi-url` without `-t`, a bad boolean or `MIRROR_MANYLINUX` |
+
+## Environment
+
+The full set is in `build_parser` and `Registry.from_env` in `mirror.py`.
+
+| Req | Name | Default | Purpose |
+|---|---|---|---|
+| With `--prune`, `publish`, `export`, `import` | `MIRROR_GITLAB_API_URL` | `$CI_API_V4_URL` | `https://gitlab.example.com/api/v4`; the flag is `--api-url` |
+| Same | `MIRROR_PROJECT` | `$CI_PROJECT_ID` | Project path or id that holds the registry; the flag is `--project` |
+| Same | `MIRROR_TOKEN` | `$CI_JOB_TOKEN` | Token: `read_api` to export, `write_registry` to publish and import |
+| Optional | `MIRROR_USERNAME` | `__token__` | Registry user; `gitlab-ci-token` with a job token |
+| Optional | `MIRROR_CA_BUNDLE` | system store | CA file for GitLab and NiFi; it replaces the system store, so it holds the full chain |
+| Optional | `MIRROR_MANYLINUX` | `2_28` | Newest glibc your Linux hosts run, as `2_<minor>`, minor 17 or newer |
+| Optional | `MIRROR_BUNDLE_REQUIREMENTS` | `true` | Bundles carry each target's `requirements.txt` and `platforms.txt` |
+| Optional | `MIRROR_BUNDLE_GIT` | `false` | Bundles carry the git history; needs git in the job image and `GIT_DEPTH` 0 |
+| Optional | `MIRROR_NIFI_URL` | unset | Default of `--nifi-url`, e.g. `https://nifi.example.com:9099/contentListener` |
+| With mutual TLS | `MIRROR_NIFI_CLIENT_CERT`, `MIRROR_NIFI_CLIENT_KEY` | unset | Client certificate and key files for NiFi |
+| Optional | `MIRROR_EXPORT_SINCE` | unset | Default of `--since`; in a pipeline it runs the `export` job |
+| Optional | `MIRROR_WHEELHOUSE_DIR` | `wheelhouse/` | `publish.sh` only: the directory it uploads from |
+| Optional | `MIRROR_SYNC` (CI) | unset | `true` on Run pipeline runs `sync` now |
+| Optional | `PYTHON_IMAGE` (CI) | `python:3.12-slim` | Job image with Python, or with curl, unzip and sha256sum |
+| Optional | `HTTPS_PROXY`, `NO_PROXY`, `PIP_INDEX_URL`, `PIP_CERT` | unset | pip's own settings for reaching PyPI |
+
+Booleans take `1 yes y true t on` or `0 no n false f off`, in any case; anything else is a usage error.
+
 ## Preconditions
 
 - The download machine's git remote is this project, and it can push to `main`.
-
-## Behaviour
-
-- `sync.sh` pulls, downloads every target into `wheelhouse/`, commits, and pushes.
-  `--no-push` stops after the commit; `--target` limits the download.
-- Every wheel stays in the repository, so it is also the archive the registry can
-  be rebuilt from. A rerun downloads only files not already in `wheelhouse/`.
-- `sync.sh --prune` instead removes the repository's copy of each wheel the registry
-  already holds, keeping the repository small. It needs `GITLAB_API_URL`,
-  `PYPI_PROJECT` and `PYPI_TOKEN`, and never removes anything from the registry.
-- A push to the default branch that changes `packages/` or `wheelhouse/` runs `publish`, which asks
-  the registry's simple index which files it holds and uploads only the rest.
-  Running the pipeline from the web UI rechecks every file.
-- `publish` never follows a redirect when checking. With package forwarding on (the
-  GitLab default, under **Admin > Settings > CI/CD > Package Registry** and each
-  group's **Packages and registries**), GitLab redirects a name it does not hold to
-  pypi.org. Turn forwarding off so air-gapped clients fail fast instead of timing out.
-- Each upload carries the wheel's `Requires-Python`, so pip on 3.9 never picks a
-  release that needs 3.10.
-- A pipeline schedule on the default branch, or a push that changes `packages/`, runs `sync`
-  instead of `publish`: it downloads
-  in the job, publishes, and writes only the files this run uploaded to
-  `delta/pypi-delta-<UTC>.tar` with a `.sha256`, kept as an artifact for 14 days.
-  Unpinned requirements pick up new releases. `MANIFEST.json` names the commit. With
-  `BUNDLE_REQUIREMENTS` the tar holds `requirements/<target>/`, and with `BUNDLE_GIT`
-  it holds `repo.bundle`, the full history. Git LFS files are not in it, so GitLab refuses
-  a push of a history that holds any ("LFS objects are missing"). A run writes
-  no bundle when it uploads nothing and those files and the commit match the last
-  bundle this runner's cache remembers.
-- On the high side, `python3 mirror.py import pypi-*.tar` checks the checksum and each
-  wheel's sha256, then uploads what that registry lacks. `--requirements DIR` writes
-  the bundled target files to `DIR/<target>/` and `--git-bundle FILE` the history;
-  pass bundles oldest first so the newest wins. After a missed or expired bundle, run
-  the pipeline with `EXPORT_SINCE` and import the `export` job's bundle.
-- An export too big for a job artifact runs from any machine that reaches this GitLab,
-  and writes the same tar to local disk to carry across by hand. It needs free space for
-  twice the bundle, and a token with `read_api`:
-  `GITLAB_API_URL=https://gitlab.example.com/api/v4 PYPI_PROJECT=platform/pypi-mirror PYPI_TOKEN=$TOKEN EXPORT_SINCE=2025-09-01 python3 mirror.py export --bundle bundle`
-- To resend one package the high side is missing, export it by name instead of by date. A
-  manual export is fresh: it takes what the registry holds, whatever was sent before.
-  `--target` keeps only the wheels that target's Python and platform can install, and a
-  version is optional. Dependencies are not added; name each one that is also missing.
-  `PYPI_TOKEN=$TOKEN python3 mirror.py export --package numpy==2.3.4 --target linux-py3.12 --bundle /share/out`
-  On the high side, `python3 mirror.py import /media/usb/pypi-pick-*.tar` uploads it.
-- With `NIFI_URL` set, `sync` and `export` also POST each bundle, with the headers
-  `Filename`, `X-Sha256`, `X-Artifact-Type: python-packages`, `X-Artifact-Format: tar`,
-  `X-Artifact-Action: mirror` and `X-Bundle-Kind`
-  (`delta` or `since-YYYY-MM-DD`), sent exactly as written. ListenHTTP's
-  `HTTP Headers for Attributes` regex `(?i)x-.*` makes the `X-` ones attributes under
-  those names, for example `${X-Artifact-Type:equals('python-packages')}` in
-  RouteOnAttribute. The regex is case-sensitive without `(?i)`. A refused POST fails the job, keeps the artifact, and the next run
-  sends a new bundle. `nifi/flow.py --side low` builds `ListenHTTP` -> `PutFile` into the
-  diode; `--side high` builds `ListFile` -> `FetchFile` -> `PutFile` into an inbox. On the
-  high side, a timer runs `mirror.py import --inbox DIR`, which imports every bundle
-  there oldest first and moves each to `DIR/done/`.
-  To publish straight from NiFi instead, import `nifi/pypi-to-gitlab.json`: native
-  processors unpack each bundle and upload every wheel to GitLab. Steps and the header
-  and tar reference are in `nifi/PYPI-TO-GITLAB.md`.
-- To make a high-side clone of this repository match the low side, discarding any
-  high-side commits: `git fetch FILE HEAD:refs/remotes/low/main`, then
-  `git push --force origin refs/remotes/low/main:refs/heads/main`. The push needs force
-  push allowed on the protected `main`.
+- A runner without git-lfs checks wheels out as pointer files, which `publish` refuses by name: delete `.gitattributes` and commit wheels as ordinary files.
 
 ## Out of scope
 
@@ -158,14 +141,4 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
 
 ## Expected result
 
-Every file in `wheelhouse/` is in the project's package registry, and pip on
-an air-gapped host installs from the group index, which serves every project in the
-group. With a public group and a public project, pip needs no token. The group is
-its id or its URL-encoded path. Uploads always go to the project.
-
-```bash
-pip install --index-url "https://gitlab.example.com/api/v4/groups/<group>/-/packages/pypi/simple" requests==2.32.5
-```
-
-For a private group, add `__token__:$TOKEN@` after `https://`, with a token that
-has `read_api` on the group.
+Every wheel you exported is in the high-side project's registry, and pip on an air-gapped host installs it from the group index (`pip install --index-url https://gitlab.high.example.com/api/v4/groups/<group>/-/packages/pypi/simple six==1.17.0`; add `__token__:$TOKEN@` after `https://` for a private group). `pypi-mirror import -n SOURCE` lists nothing left to upload.
