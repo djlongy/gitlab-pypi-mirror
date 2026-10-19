@@ -69,7 +69,7 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
 ```
 
 `sync.sh [TARGET...]` pulls, runs `download` into one `wheelhouse/`, commits and pushes; `--no-push` stops after the commit and `--prune` also runs `prune`.
-Only wheels are mirrored, with every dependency. A package with no wheel for a target fails that target. Renovate updates `==` pins, one MR per Python version, and `pypi-mirror check` (the CI test job) fails when `renovate.json` does not hold a target to its Python. `pypi-mirror pin` pins bare names.
+Only wheels are mirrored, with every dependency. A package that publishes only a source distribution, such as `pyspark`, is built into a wheel on the download machine; a pure-Python build (`py3-none-any`) installs on every target. A package whose build is compiled, or that has no usable release at all, is skipped with a warning that names the fix, and the rest of the sync continues. `download` exits 1 only when every line was skipped. Renovate updates `==` pins, one MR per Python version, and `pypi-mirror check` (the CI test job) fails when `renovate.json` does not hold a target to its Python. `pypi-mirror pin` pins bare names.
 
 ## Run it in a pipeline
 

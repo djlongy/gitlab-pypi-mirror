@@ -270,7 +270,7 @@ class CliTest(tm.CliMixin, tm.FakeRegistry):
             self.assertEqual(self.run_cli("download", "--pip-arg", "--no-deps")[0], 2)
             self.assertEqual(len(commands), 1)
 
-    def test_a_failed_pip_download_exits_1_and_names_the_targets(self):
+    def test_download_exits_1_when_every_requirement_is_skipped(self):
         self.target("linux-py3.12", "idna\n")
 
         def run(command, check):
@@ -279,7 +279,65 @@ class CliTest(tm.CliMixin, tm.FakeRegistry):
         with mock.patch.object(mirror.subprocess, "run", side_effect=run):
             code, out = self.run_cli("download")
         self.assertEqual((code, out), (1, ""))
-        self.assertIn(f"{mirror.prog()}: 1 target(s) failed: linux-py3.12", self.err)
+        self.assertIn("every requirement was skipped (linux-py3.12: idna)", self.err)
+
+    def pip(self, wheels, sdists=(), builds=None):
+        """A fake pip: download writes the named wheel (or sdist), wheel writes the built file."""
+        commands = []
+
+        def run(command, check):
+            commands.append(command)
+            if "wheel" in command:
+                out = Path(command[command.index("--wheel-dir") + 1])
+                out.mkdir(parents=True, exist_ok=True)
+                (out / builds[Path(command[-1]).name]).write_bytes(b"")
+                return
+            dest = Path(command[command.index("--dest") + 1])
+            if "-r" not in command:  # the built wheel resolving its dependencies
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / "py4j-0.10.9.9-py2.py3-none-any.whl").write_bytes(b"")
+                return
+            line = Path(command[command.index("-r") + 1]).read_text().split()[-1]
+            if "--no-binary=:all:" in command:
+                if line not in sdists:
+                    raise mirror.subprocess.CalledProcessError(1, command)
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / sdists[line]).write_bytes(b"")
+                return
+            if line not in wheels:  # also the whole-file attempt, whose -r is the real file
+                raise mirror.subprocess.CalledProcessError(1, command)
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / wheels[line]).write_bytes(b"")
+
+        return commands, mock.patch.object(mirror.subprocess, "run", side_effect=run)
+
+    def test_a_package_with_no_usable_wheel_is_skipped_with_a_fix_and_the_rest_download(self):
+        self.target("linux-py3.10", "idna==3.20\nnative==1.0\n")
+        _, pip = self.pip({"idna==3.20": "idna-3.20-py3-none-any.whl"},
+                          sdists={"native==1.0": "native-1.0.tar.gz"},
+                          builds={"native-1.0.tar.gz": "native-1.0-cp312-cp312-macosx_14_0_arm64.whl"})
+        with pip:
+            code, out = self.run_cli("download")
+        self.assertEqual((code, out), (0, ""))
+        wheelhouse = sorted(p.name for p in mirror.wheelhouse().iterdir())
+        self.assertEqual(wheelhouse, ["idna-3.20-py3-none-any.whl"])
+        self.assertIn("compiled for this machine", self.err)
+        self.assertIn("skipped native==1.0", self.err)
+        self.assertIn("pip wheel --no-deps", self.err)
+        self.assertIn("1 requirement(s) skipped, the rest downloaded: linux-py3.10: native==1.0", self.err)
+
+    def test_a_pure_python_sdist_is_built_into_a_wheel_with_its_dependencies(self):
+        self.target("windows-py3.10", "pyspark==4.0.1\n")
+        commands, pip = self.pip({}, sdists={"pyspark==4.0.1": "pyspark-4.0.1.tar.gz"},
+                                 builds={"pyspark-4.0.1.tar.gz": "pyspark-4.0.1-py2.py3-none-any.whl"})
+        with pip:
+            code, out = self.run_cli("download")
+        self.assertEqual((code, out), (0, ""))
+        self.assertEqual(sorted(p.name for p in mirror.wheelhouse().iterdir()),
+                         ["py4j-0.10.9.9-py2.py3-none-any.whl", "pyspark-4.0.1-py2.py3-none-any.whl"])
+        sdist = next(c for c in commands if "--no-binary=:all:" in c)
+        self.assertEqual(sdist[sdist.index("--python-version") + 1], "3.10")
+        self.assertNotIn("skipped", self.err)
 
     # publish
 

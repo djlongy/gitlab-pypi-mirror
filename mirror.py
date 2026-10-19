@@ -686,22 +686,109 @@ def cmd_check(args) -> int:
     return 1 if gaps else 0
 
 
-def pip_download(target: Target) -> None:
+def target_flags(target: Target) -> List[str]:
+    """pip download flags that pick wheels for this target's Python and platform, not the host's."""
+    flags = ["--only-binary=:all:", "--python-version", target.python, "--implementation", "cp"]
+    for platform in target.platforms:
+        flags += ["--platform", platform]
+    return flags
+
+
+def pip_download(target: Target) -> List[str]:
+    """Download every requirement of this target into the wheelhouse. Returns the lines it had to skip."""
     wheelhouse().mkdir(exist_ok=True)
     base = [sys.executable, "-m", "pip", "download", "--dest", str(wheelhouse()),
             "--disable-pip-version-check", "--progress-bar", "off"]
     requirements = target.path / "requirements.txt"
-    if requirements.is_file() and read_lines(requirements):
-        # Wheels only, for every package and every dependency. A source
-        # distribution needs a compiler and build dependencies on the
-        # air-gapped host; a package with no wheel for this target fails the
-        # download here instead of failing the install there.
-        command = base + ["-r", str(requirements), "--only-binary=:all:",
-                          "--python-version", target.python, "--implementation", "cp"]
-        for platform in target.platforms:
-            command += ["--platform", platform]
-        progress(f"==> {target.name}: {' '.join(command[3:])}")
+    if not (requirements.is_file() and read_lines(requirements)):
+        return []
+    # Wheels only, for every package and every dependency. A source
+    # distribution needs a compiler and build dependencies on the air-gapped
+    # host; a package with no wheel for this target fails the download here
+    # instead of failing the install there.
+    command = base + ["-r", str(requirements)] + target_flags(target)
+    progress(f"==> {target.name}: {' '.join(command[3:])}")
+    try:
         subprocess.run(command, check=True)
+        return []
+    except subprocess.CalledProcessError:
+        warn(f"{target.name}: the whole-file download failed; retrying one requirement at a time")
+    lines = read_lines(requirements)
+    options = [line for line in lines if line.startswith("-")]  # -i, --extra-index-url, -c ...
+    skipped = []
+    for line in (line for line in lines if not line.startswith("-")):
+        if not fetch_one(target, line, options):
+            skipped.append(line)
+            warn(f"{target.name}: skipped {line}: no wheel for {target.os} Python {target.python}, "
+                 f"and its source distribution did not build into a wheel that installs there.\n"
+                 f"  Fix one of: pin a release that has a wheel for this target "
+                 f"(https://pypi.org/project/{BARE_NAME_RE.match(line)[0]}/#files); "
+                 f"build the wheel on a {target.os} Python {target.python} machine with "
+                 f"'pip wheel --no-deps \"{line}\"' and copy it into {WHEELHOUSE}/; "
+                 f"or remove the line from {requirements.relative_to(ROOT)}.")
+    return skipped
+
+
+BARE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def fetch_one(target: Target, line: str, options: List[str]) -> bool:
+    """One requirement and its dependencies into the wheelhouse: its wheel, else a wheel built from its sdist.
+
+    Every file lands in a temporary directory first, so a requirement that fails leaves nothing behind."""
+    pip = [sys.executable, "-m", "pip", "--disable-pip-version-check"]
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        spec = work / "requirement.txt"
+        spec.write_text("\n".join(options + [line]) + "\n")
+        got = work / "got"
+        try:
+            subprocess.run(pip + ["download", "--quiet", "--progress-bar", "off", "--dest", str(got),
+                                  "-r", str(spec)] + target_flags(target), check=True)
+        except subprocess.CalledProcessError:
+            if not build_from_sdist(target, spec, work, got):
+                return False
+        for path in got.iterdir():
+            if not (wheelhouse() / path.name).exists():
+                shutil.move(str(path), str(wheelhouse() / path.name))
+    return True
+
+
+def build_from_sdist(target: Target, spec: Path, work: Path, got: Path) -> bool:
+    """Build a wheel from the requirement's sdist and download its dependencies as wheels for the target.
+
+    Only a wheel the target can install is kept: a pure-Python build (py3-none-any)
+    fits every target; a compiled one fits only the machine that built it."""
+    pip = [sys.executable, "-m", "pip", "--disable-pip-version-check"]
+    src, built = work / "src", work / "built"
+    progress(f"    {target.name}: no wheel for {spec.read_text().split()[-1]}, building one from its source distribution")
+    try:
+        # --no-deps lets --python-version pick a release the target's Python supports
+        # without --only-binary; the dependencies come as wheels below.
+        subprocess.run(pip + ["download", "--quiet", "--progress-bar", "off", "--dest", str(src), "--no-deps",
+                              "--no-binary=:all:", "--python-version", target.python, "-r", str(spec)], check=True)
+        sdists = sorted(src.iterdir())
+        if len(sdists) != 1:
+            return False
+        subprocess.run(pip + ["wheel", "--quiet", "--no-deps", "--wheel-dir", str(built), str(sdists[0])], check=True)
+    except subprocess.CalledProcessError:
+        return False
+    wheels = sorted(built.glob("*.whl"))
+    if len(wheels) != 1:
+        return False
+    if not wheel_fits(wheels[0].name, target):
+        warn(f"{target.name}: built {wheels[0].name}, which is compiled for this machine, not for the target")
+        return False
+    try:
+        # The built wheel resolves its own dependencies, as wheels for the target.
+        subprocess.run(pip + ["download", "--quiet", "--progress-bar", "off", "--dest", str(got), str(wheels[0])]
+                       + target_flags(target), check=True)
+    except subprocess.CalledProcessError:
+        return False
+    got.mkdir(exist_ok=True)
+    if not (got / wheels[0].name).exists():
+        shutil.copy2(wheels[0], got / wheels[0].name)
+    return True
 
 
 BARE_RE = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)(?P<extras>\[[^\]]*\])?\s*(?P<comment>#.*)?$")
@@ -779,17 +866,20 @@ def cmd_pin(args) -> int:
 
 
 def cmd_download(args) -> int:
-    failed = []
     adopt_target_wheelhouses()
-    for target in find_targets(args.targets):
-        try:
-            pip_download(target)
-        except subprocess.CalledProcessError:
-            failed.append(target.name)
-            fail(f"pip download failed for {target.name}")
-    if failed:
-        fail(f"{len(failed)} target(s) failed: {', '.join(failed)}")
+    targets = find_targets(args.targets)
+    skipped = {target.name: pip_download(target) for target in targets}
+    skips = [f"{name}: {line}" for name, lines in skipped.items() for line in lines]
+    if not skips:
+        return 0
+    # A package with no usable wheel is skipped, so one bad line does not stop the
+    # sync. Every line skipped means pip reached nothing: an outage, not a package.
+    wanted = sum(len([l for l in read_lines(t.path / "requirements.txt") if not l.startswith("-")])
+                 for t in targets if (t.path / "requirements.txt").is_file())
+    if len(skips) == wanted:
+        fail(f"every requirement was skipped ({'; '.join(skips)}); check that pip can reach the index")
         return 1
+    warn(f"{len(skips)} requirement(s) skipped, the rest downloaded: {'; '.join(skips)}")
     return 0
 
 
@@ -1073,10 +1163,13 @@ def build_parser() -> argparse.ArgumentParser:
     download = command("download", cmd_download, "pip download every target into wheelhouse/",
                        "  {prog} download\n  {prog} download linux-py3.12",
                        "which packages: every line of each target's requirements.txt and all their dependencies, as\n"
-                       "wheels only, for that target's Python and platform tags (pip --only-binary=:all:).\n"
+                       "wheels only, for that target's Python and platform tags (pip --only-binary=:all:). A package\n"
+                       "with no wheel (pyspark) is built from its sdist into a wheel, kept only if it installs on the\n"
+                       "target (py3-none-any); otherwise it is skipped with a warning that says how to fix it.\n"
                        "sources: PyPI, or what pip reads from PIP_INDEX_URL, HTTPS_PROXY and PIP_CERT.\n"
                        "what it writes: wheelhouse/, one directory for all targets. A wheel already there is not fetched again.\n"
-                       "check it: ls wheelhouse/ ; a target with no wheel for a package fails and is named, exit 1.\n\n")
+                       "check it: ls wheelhouse/ ; skipped lines are listed at the end, exit 0. Exit 1 when every line\n"
+                       "was skipped, which means pip reached nothing.\n\n")
     download.add_argument("targets", nargs="*", metavar="TARGET", help="a target directory name under packages/ (default: all)")
     publish = command("publish", cmd_publish, "upload wheelhouse files the registry does not have",
                       "  {prog} publish\n  {prog} publish --dry-run\n  {prog} publish -t delta\n"
