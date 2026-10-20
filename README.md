@@ -77,7 +77,7 @@ A push to `main` that changes `packages/` or `wheelhouse/` runs `publish`: it as
 A schedule, or Run pipeline with `MIRROR_SYNC=true`, runs `sync`: it downloads, publishes and writes only the uploaded files to `delta/pypi-delta-<UTC>.tar` with a `.sha256`, kept 14 days. Carry the tar and run `pypi-mirror import delta --requirements packages`.
 After a missed bundle, run the pipeline with `MIRROR_EXPORT_SINCE=YYYY-MM-DD` and a masked `EXPORT_TOKEN` (project access token, Reporter, `read_api`); the `export` job bundles every file received since.
 With `MIRROR_NIFI_URL` set, `sync` and `export` also POST each tar to a NiFi ListenHTTP with the headers `Filename`, `X-Sha256`, `X-Artifact-Type: python-packages`, `X-Artifact-Format: tar`, `X-Artifact-Action: mirror` and `X-Bundle-Kind`. `nifi/flow.py --side low|high` builds the transfer flow (the NiFi password comes from `--password-stdin` or `NIFI_PASSWORD`), and `nifi/pypi-to-gitlab.json` uploads each wheel to GitLab from NiFi. On the high side a timer runs `pypi-mirror import DIR`. Steps are in `nifi/PYPI-TO-GITLAB.md`.
-With `MIRROR_REQUEST_URL` set, `sync` ends with `request`: one small JSON POST naming every wheel the registry holds that the ledger has not recorded as requested. The low NiFi downloads each wheel from the registry itself and sends it across the link as its own FlowFile, so no POST carries a wheel and a wheel of any size crosses. The ledger is the generic package `pypi-mirror-ledger/v1/ledger.json` of this project; a failed POST leaves it unchanged, so the next run asks again. `MIRROR_RESEND_PACKAGES` (lines of `NAME[==VERSION]`) and `MIRROR_RESEND_ALL=true` ask again on Run pipeline. `nifi/flow.py --side request-low|request-high` builds both flows (`nifi/pypi-request-low.json`, `nifi/pypi-request-high.json`); steps are in `nifi/PYPI-REQUEST.md`.
+With `MIRROR_REQUEST_URL` set, `sync` ends with `request`: small JSON POSTs, `MIRROR_REQUEST_BATCH` wheels each, naming every wheel the registry holds that the ledger has not recorded as sent. The low NiFi downloads each wheel from the registry itself and sends it across the link as its own FlowFile, so no POST carries a wheel and a wheel of any size crosses. The ledger is the generic package `pypi-mirror-ledger/v1/ledger.json` of this project; it records each batch NiFi accepts with its time and pipeline, so a failed batch, and every batch after it, is asked for again on the next run. `MIRROR_RESEND_PACKAGES` (lines of `NAME[==VERSION]`) and `MIRROR_RESEND_ALL=true` ask again on Run pipeline. `nifi/flow.py --side request-low|request-high` builds both flows (`nifi/pypi-request-low.json`, `nifi/pypi-request-high.json`); steps are in `nifi/PYPI-REQUEST.md`.
 
 ## Commands
 
@@ -120,6 +120,7 @@ The full set is in `build_parser` and `Registry.from_env` in `mirror.py`.
 | Optional | `MIRROR_MANYLINUX` | `2_28` | Newest glibc your Linux hosts run, as `2_<minor>`, minor 17 or newer |
 | Optional | `MIRROR_BUILD_RUNTIME` | `podman`, else `docker` | Container runtime that builds a wheel from an sdist; `none` builds with this machine's pip |
 | Optional | `MIRROR_BUILD_IMAGE` | `python:{python}-slim` | Build image, `{python}` is the target's version; point it at your internal registry |
+| Optional | `MIRROR_STAGING_DIR` | `.tmp/` beside `mirror.py` | Temporary files and source builds, on a large disk instead of the checkout |
 | Optional | `MIRROR_HEARTBEAT` | `15` | Seconds of pip silence before `download` prints elapsed time and MB written |
 | Optional | `MIRROR_BUNDLE_REQUIREMENTS` | `true` | Bundles carry each target's `requirements.txt` and `platforms.txt` |
 | Optional | `MIRROR_BUNDLE_GIT` | `false` | Bundles carry the git history; needs git in the job image and `GIT_DEPTH` 0 |
@@ -127,7 +128,8 @@ The full set is in `build_parser` and `Registry.from_env` in `mirror.py`.
 | With mutual TLS | `MIRROR_NIFI_CLIENT_CERT`, `MIRROR_NIFI_CLIENT_KEY` | unset | Client certificate and key files for NiFi |
 | With `request` | `MIRROR_REQUEST_URL` | unset | Low NiFi ListenHTTP for requests, e.g. `https://nifi.example.com:9310/pypi-request`; the flag is `--request-url` |
 | Optional | `MIRROR_REQUEST_TOKEN`, `MIRROR_REQUEST_CA_BUNDLE` | unset, `MIRROR_CA_BUNDLE` | Sent as `Authorization: Bearer`; CA file for that URL |
-| Optional | `MIRROR_LEDGER` | the project's generic package in CI, else `.mirror-ledger.json` | What `request` has asked for: a file, or `gitlab` |
+| Optional | `MIRROR_REQUEST_BATCH` | `200` | Wheels per request POST; the ledger records each batch NiFi accepts |
+| Optional | `MIRROR_LEDGER` | the project's generic package in CI, else `.mirror-ledger.json` | What `request` has sent, when and from which pipeline: a file, or `gitlab` |
 | Optional | `MIRROR_RESEND_ALL`, `MIRROR_RESEND_PACKAGES` (CI) | unset | `request` every wheel, or the `NAME[==VERSION]` lines given |
 | Optional | `MIRROR_EXPORT_SINCE` | unset | Default of `--since`; in a pipeline it runs the `export` job |
 | Optional | `MIRROR_WHEELHOUSE_DIR` | `wheelhouse/` | `publish.sh` only: the directory it uploads from |

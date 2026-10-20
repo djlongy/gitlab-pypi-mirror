@@ -700,8 +700,8 @@ def target_flags(target: Target) -> List[str]:
 def scratch() -> Path:
     """Temporary files beside the wheelhouse. /tmp is often a small tmpfs, and fapolicyd or a
     noexec mount there refuses a source build: one multi-GB wheel or one sdist fails the run."""
-    path = ROOT / ".tmp"
-    path.mkdir(exist_ok=True)
+    path = Path(os.environ.get("MIRROR_STAGING_DIR") or ROOT / ".tmp")
+    path.mkdir(parents=True, exist_ok=True)
     return path
 
 
@@ -1116,7 +1116,7 @@ def cmd_download(args) -> int:
         return 0
     # A package with no usable wheel is skipped, so one bad line does not stop the
     # sync. Every line skipped means pip reached nothing: an outage, not a package.
-    wanted = sum(len([l for l in read_lines(t.path / "requirements.txt") if not l.startswith("-")])
+    wanted = sum(len([line for line in read_lines(t.path / "requirements.txt") if not line.startswith("-")])
                  for t in targets if (t.path / "requirements.txt").is_file())
     if len(skips) == wanted:
         fail(f"every requirement was skipped ({'; '.join(skips)}); check that pip can reach the index")
@@ -1174,15 +1174,16 @@ def cmd_publish(args) -> int:
 #
 # A bundle can exceed what the low NiFi accepts in one POST. A request is a small JSON
 # list of wheels already in the registry; the low NiFi downloads each one from the
-# registry and sends it across the link as its own FlowFile. The ledger records what
-# was requested, so each wheel is asked for once, and a failed POST is asked for again.
+# registry and sends it across the link as its own FlowFile. Requests go in batches of
+# MIRROR_REQUEST_BATCH wheels, and the ledger records each batch once NiFi takes it, so
+# each wheel is asked for once and a failed batch, with every batch after it, is asked for again.
 
 LEDGER_PACKAGE, LEDGER_VERSION, LEDGER_NAME = "pypi-mirror-ledger", "v1", "ledger.json"
 REQUEST_TYPE = "python-packages-request"
 
 
 class Ledger:
-    """What request has asked the low NiFi for: {file name: sha256}. In a GitLab CI job (or with
+    """What request has sent the low NiFi: {file name: {sha256, time, pipeline}}. In a GitLab CI job (or with
     MIRROR_LEDGER=gitlab) a file in the project's generic packages, so nothing lives on the runner;
     else MIRROR_LEDGER or .mirror-ledger.json beside mirror.py."""
 
@@ -1220,16 +1221,18 @@ class Ledger:
         if data.get("registry") != self.registry.base:
             raise MirrorError(f"the ledger at {self.where()} belongs to {data.get('registry')}, not "
                               f"{self.registry.base}; set MIRROR_LEDGER to another file")
-        return dict(data.get("requested", {}))
+        # Ledgers before sent kept {file name: sha256} under requested.
+        older = {name: {"sha256": digest} for name, digest in data.get("requested", {}).items()}
+        return {**older, **data.get("sent", {})}
 
-    def save(self, requested: Dict[str, str]) -> None:
-        body = json.dumps({"registry": self.registry.base, "requested": requested}, indent=1, sort_keys=True).encode()
+    def save(self, sent: Dict[str, Dict[str, str]]) -> None:
+        body = json.dumps({"registry": self.registry.base, "sent": sent}, indent=1, sort_keys=True).encode()
         if self.in_gitlab:
             # ponytail: GitLab keeps every upload of the file and serves the newest; prune old ones if they pile up.
             self._call("PUT", body)
         else:
             self.path.write_bytes(body)
-        progress(f"ledger: {self.where()} records {len(requested)} requested file(s)")
+        progress(f"ledger: {self.where()} records {len(sent)} sent file(s)")
 
 
 def request_body(registry: "Registry", files: List[Path]) -> Dict[str, object]:
@@ -1279,7 +1282,7 @@ def cmd_request(args) -> int:
         raise UsageError("request needs --request-url or MIRROR_REQUEST_URL")
     registry = Registry.from_env()
     ledger = Ledger(registry)
-    requested = ledger.load()
+    sent = ledger.load()
     specs = read_specs(args)
     every = args.all or env_flag("MIRROR_RESEND_ALL")
     wanted = []
@@ -1290,7 +1293,7 @@ def cmd_request(args) -> int:
                     not SPEC_RE.fullmatch(spec)[2]
                     or canonical_version(SPEC_RE.fullmatch(spec)[2]) == canonical_version(version)) for spec in specs):
                 continue
-        elif not every and path.name in requested:
+        elif not every and path.name in sent:
             continue
         if path.name not in registry.existing(name):  # the low NiFi downloads it from there
             warn(f"{path.name} is not in the registry yet, not requested; run publish first")
@@ -1306,11 +1309,23 @@ def cmd_request(args) -> int:
             print(f"would request {path.name}")
         print(f"would post {len(wanted)} file(s) to {url}")
         return 0
-    body = request_body(registry, wanted)
-    post_request(body, url)
-    progress(f"requested {len(wanted)} file(s) from {url}")
-    requested.update({entry["filename"]: entry["sha256"] for entry in body["files"]})
-    ledger.save(requested)
+    # One POST per batch keeps each body under a proxy's size limit (nginx ingress allows 1 MB by default).
+    size = int(os.environ.get("MIRROR_REQUEST_BATCH") or 200)
+    batches = [wanted[start:start + size] for start in range(0, len(wanted), size)]
+    for number, batch in enumerate(batches, 1):
+        body = request_body(registry, batch)
+        try:
+            post_request(body, url)
+        except MirrorError as error:
+            left = len(wanted) - (number - 1) * size
+            raise MirrorError(f"{error}; batch {number} of {len(batches)} failed, {left} file(s) not sent: "
+                              "the ledger keeps the batches before it, and the next run asks for the rest") from error
+        progress(f"requested {len(batch)} file(s) from {url} (batch {number} of {len(batches)})")
+        when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        pipeline = os.environ.get("CI_PIPELINE_URL", "")
+        sent.update({entry["filename"]: {"sha256": entry["sha256"], "time": when, "pipeline": pipeline}
+                     for entry in body["files"]})
+        ledger.save(sent)
     return 0
 
 

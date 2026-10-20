@@ -135,7 +135,8 @@ class FakeGitLab(BaseHTTPRequestHandler):
             body = self.rfile.read(int(self.headers["Content-Length"]))
             self.server.posted.append((self.headers["filename"], self.headers["x-sha256"], body))
             self.server.post_headers.append(dict(self.headers.items()))  # names as sent
-            self.send_response(self.server.post_status)
+            status = self.server.post_status  # a list answers one POST per entry, in order
+            self.send_response(status.pop(0) if isinstance(status, list) else status)
             self.end_headers()
             return
         if not self._authorized():

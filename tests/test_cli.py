@@ -473,7 +473,7 @@ class CliTest(tm.CliMixin, tm.FakeRegistry):
         self.assertEqual((entry["name"], entry["version"], entry["sha256"], entry["size"]),
                          ("idna", "3.20", mirror.sha256_file(idna), idna.stat().st_size))
         self.assertEqual(entry["url"], f"{body['registry']}/files/{entry['sha256']}/{idna.name}")
-        self.assertEqual(sorted(self.ledger()["requested"]), sorted(f["filename"] for f in body["files"]))
+        self.assertEqual(sorted(self.ledger()["sent"]), sorted(f["filename"] for f in body["files"]))
         self.assertEqual(self.run_cli("request", "--request-url", self.request_url())[0], 0)
         self.assertIn("nothing new to request", self.err)
         self.assertEqual(len(self.server.posted), 1)
@@ -492,7 +492,40 @@ class CliTest(tm.CliMixin, tm.FakeRegistry):
         self.assertIsNone(self.ledger())
         self.server.post_status = 200
         self.assertEqual(self.run_cli("request", "--request-url", self.request_url())[0], 0)
-        self.assertEqual(list(self.ledger()["requested"]), ["idna-3.20-py3-none-any.whl"])
+        self.assertEqual(list(self.ledger()["sent"]), ["idna-3.20-py3-none-any.whl"])
+
+    def test_request_posts_batches_and_records_each_before_the_next(self):
+        wheelhouse = self.target("linux-py3.12")
+        names = [f"pkg{n}-1.0-py3-none-any.whl" for n in range(5)]
+        for name in names:
+            tm.make_wheel(wheelhouse, name)
+        self.run_cli("publish")
+        os.environ["MIRROR_REQUEST_BATCH"] = "2"
+        os.environ["CI_PIPELINE_URL"] = "https://gitlab.example.com/p/-/pipelines/7"
+        self.addCleanup(os.environ.pop, "MIRROR_REQUEST_BATCH")
+        self.addCleanup(os.environ.pop, "CI_PIPELINE_URL")
+        self.server.post_status = [200, 503]  # the second batch meets back pressure
+        self.assertEqual(self.run_cli("request", "--request-url", self.request_url())[0], 1)
+        self.assertIn("batch 2 of 3 failed, 3 file(s) not sent", self.err)
+        sent = self.ledger()["sent"]
+        self.assertEqual(len(sent), 2)
+        self.assertEqual({entry["pipeline"] for entry in sent.values()}, {"https://gitlab.example.com/p/-/pipelines/7"})
+        self.assertRegex(next(iter(sent.values()))["time"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.server.post_status = 200
+        self.assertEqual(self.run_cli("request", "--request-url", self.request_url())[0], 0, self.err)
+        self.assertEqual(sorted(self.ledger()["sent"]), sorted(names))
+        self.assertEqual([len(json.loads(raw)["files"]) for _, _, raw in self.server.posted], [2, 2, 2, 1])  # the refused batch again, then the last
+
+    def test_a_ledger_of_requested_digests_reads_as_sent(self):
+        tm.make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")
+        self.run_cli("publish")
+        old = json.dumps({"registry": "http://127.0.0.1:%d/api/v4/projects/42/packages/pypi" % self.server.server_port,
+                          "requested": {"idna-3.20-py3-none-any.whl": "0" * 64}})
+        local = Path(self.tmp.name) / "ledger.json"
+        local.write_text(old)
+        os.environ["MIRROR_LEDGER"] = str(local)
+        self.assertEqual(self.run_cli("request", "--request-url", self.request_url())[0], 0, self.err)
+        self.assertIn("nothing new to request", self.err)
 
     def test_request_dry_run_posts_nothing_and_a_local_ledger_outside_ci(self):
         tm.make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")
@@ -504,7 +537,7 @@ class CliTest(tm.CliMixin, tm.FakeRegistry):
         local = Path(self.tmp.name) / "ledger.json"
         os.environ["MIRROR_LEDGER"] = str(local)
         self.assertEqual(self.run_cli("request")[0], 0, self.err)
-        self.assertEqual(list(json.loads(local.read_text())["requested"]), ["idna-3.20-py3-none-any.whl"])
+        self.assertEqual(list(json.loads(local.read_text())["sent"]), ["idna-3.20-py3-none-any.whl"])
         self.assertIsNone(self.ledger())
         self.assertEqual(self.run_cli("request", "nosuch")[0], 1)
         self.assertIn("matches nosuch", self.err)

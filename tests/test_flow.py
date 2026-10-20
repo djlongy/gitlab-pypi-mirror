@@ -194,7 +194,8 @@ class LayoutTests(unittest.TestCase):
                 for b, (bx, by, bw, bh) in items[i + 1:]:
                     with self.subTest(side=side, overlap=(n.names[a], n.names[b])):
                         self.assertFalse(ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah)
-            centre = lambda c: (boxes[c][0] + boxes[c][2] / 2, boxes[c][1] + boxes[c][3] / 2)
+            def centre(c):
+                return boxes[c][0] + boxes[c][2] / 2, boxes[c][1] + boxes[c][3] / 2
             for src, dst, bends in n.lines:
                 if src == dst:
                     self.assertEqual(len(bends), 2, "a self loop needs two bends to be drawn")

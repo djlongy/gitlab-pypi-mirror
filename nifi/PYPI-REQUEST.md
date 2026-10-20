@@ -23,12 +23,13 @@ Headers, names as written: `Content-Type: application/json`, `Filename` (`pypi-r
 
 ## The ledger
 
-`request` names each wheel in the registry once. After the POST succeeds it records
-`{filename: sha256}` in the ledger: in CI the generic package `pypi-mirror-ledger/v1/ledger.json`
-of the mirror project (the job token reads and writes it), elsewhere `MIRROR_LEDGER` or
-`.mirror-ledger.json`. A failed POST changes nothing, so the next run asks again.
+`request` names each wheel in the registry once, in POSTs of `MIRROR_REQUEST_BATCH` (200)
+wheels. After each POST succeeds it records `sent: {filename: {sha256, time, pipeline}}` in the
+ledger: in CI the generic package `pypi-mirror-ledger/v1/ledger.json` of the mirror project (the
+job token reads and writes it), elsewhere `MIRROR_LEDGER` or `.mirror-ledger.json`. A failed
+POST stops the run: the batches before it stay recorded, and the next run asks for the rest.
 
-The ledger records what was requested, not what arrived: a one-way link sends no receipt.
+The ledger records what was sent, not what arrived: a one-way link sends no receipt.
 The high side is idempotent (a wheel GitLab already holds routes to Uploaded), so to fill
 a gap, request again: `request NAME[==VERSION]`, `request --all`, or in a pipeline
 `MIRROR_RESEND_PACKAGES` and `MIRROR_RESEND_ALL=true`.
