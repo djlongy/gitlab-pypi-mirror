@@ -36,8 +36,13 @@ stages:
   - test
   - publish
 
+# Set MIRROR_SKIP_TESTS=true (CI/CD variable or Run pipeline) to publish without running the tests.
 test:
   stage: test
+  rules:
+    - if: $MIRROR_SKIP_TESTS == "true"
+      when: never
+    - when: on_success
   script:
     - |
       if command -v python3 >/dev/null 2>&1; then

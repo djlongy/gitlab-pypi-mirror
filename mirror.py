@@ -1281,8 +1281,11 @@ class Ledger:
 
     def _call(self, method: str, data: Optional[bytes] = None) -> Optional[bytes]:
         request = urllib.request.Request(self.url, data=data, method=method)
-        # A job token reads and writes its own project's generic packages; the REST API wants it as JOB-TOKEN.
-        request.add_header("JOB-TOKEN" if self.registry.job_token else "PRIVATE-TOKEN", self.registry.token)
+        # A job token goes as JOB-TOKEN. Any other goes as Basic auth: GitLab refuses a deploy token as PRIVATE-TOKEN.
+        if self.registry.job_token:
+            request.add_header("JOB-TOKEN", self.registry.token)
+        else:
+            request.add_header("Authorization", self.registry.auth)
         opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=self.registry.context), _NoRedirect())
         try:
             with opener.open(request, timeout=120) as response:

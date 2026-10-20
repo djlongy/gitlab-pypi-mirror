@@ -113,10 +113,9 @@ class FakeGitLab(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(body).encode())
 
     def _generic(self):
-        """GET and PUT of a generic package file: the request ledger. A job token arrives as JOB-TOKEN."""
-        if (self.headers.get("JOB-TOKEN") or self.headers.get("PRIVATE-TOKEN")) != TOKEN:
-            self.send_response(401)
-            self.end_headers()
+        """GET and PUT of a generic package file: the request ledger. A job token arrives as JOB-TOKEN, any
+        other token as Basic auth, the one form a deploy token shares with personal and project tokens."""
+        if self.headers.get("JOB-TOKEN") != TOKEN and not self._authorized():
             return
         if self.command == "PUT":
             self.server.generic[self.path] = self.rfile.read(int(self.headers["Content-Length"]))
@@ -298,26 +297,26 @@ class TargetTests(CliMixin, Workspace):
 
     def test_pin_resolves_with_pip_download_for_the_targets_python(self):
         """EL9's stock pip 21.3.1 has no install --dry-run or --report."""
-        self.assertNotEqual("%d.%d" % sys.version_info[:2], "3.11", "the target must differ from the host python")
-        self.target("linux-py3.11", "requests[socks]\n")
+        version = "3.10" if sys.version_info[:2] == (3, 11) else "3.11"  # the target must differ from the host
+        self.target(f"linux-py{version}", "requests[socks]\n")
         commands, pip = self.fake_pip("requests-2.32.5-py3-none-any.whl", "PySocks-1.7.1-py3-none-any.whl",
                                       "urllib3-2.5.0-py3-none-any.whl")
         with pip, redirect_stdout(io.StringIO()):
             mirror.cmd_pin(mock.Mock(path=None, dry_run=False))
         command = commands[0]
         self.assertEqual(command[1:3], ["-c", mirror.PIP_AS_TARGET])
-        self.assertEqual(json.loads(command[3])["python_version"], "3.11")
+        self.assertEqual(json.loads(command[3])["python_version"], version)
         self.assertEqual(command[4], "download")
         for flag in ("--dry-run", "--report", "--target", "install"):
             self.assertNotIn(flag, command)
         self.assertNotEqual(mirror.wheelhouse(), Path(command[command.index("--dest") + 1]))
-        self.assertEqual(command[command.index("--python-version") + 1], "3.11")
+        self.assertEqual(command[command.index("--python-version") + 1], version)
         self.assertIn("--only-binary=:all:", command)
         self.assertIn("--disable-pip-version-check", command)
         self.assertEqual(command[command.index("--implementation") + 1], "cp")
         platforms = [command[i + 1] for i, arg in enumerate(command) if arg == "--platform"]
         self.assertEqual(platforms, mirror.linux_platforms(mirror.manylinux(), "x86_64"))
-        self.assertEqual((self.packages / "linux-py3.11" / "requirements.txt").read_text(),
+        self.assertEqual((self.packages / f"linux-py{version}" / "requirements.txt").read_text(),
                          "requests[socks]==2.32.5\n", "dependencies are downloaded but never pinned")
 
     def test_pip_judges_environment_markers_as_the_target(self):
@@ -428,6 +427,14 @@ class FakeRegistry(Workspace):
 
 
 class RegistryTests(CliMixin, FakeRegistry):
+
+    def test_the_gitlab_ledger_takes_a_deploy_token(self):
+        """A deploy token works only as Basic auth on generic packages, never as PRIVATE-TOKEN."""
+        with mock.patch.dict(os.environ, {"MIRROR_LEDGER": "gitlab", "MIRROR_TOKEN": TOKEN,
+                                          "MIRROR_USERNAME": "gitlab+deploy-token-1"}):
+            ledger = mirror.Ledger(mirror.Registry.from_env())
+            ledger.save({"six-1.17.0-py2.py3-none-any.whl": {"sha256": "0"}})
+            self.assertEqual(list(ledger.load()), ["six-1.17.0-py2.py3-none-any.whl"])
 
     def test_publish_uploads_only_what_is_missing_and_a_rerun_uploads_nothing(self):
         linux = self.target("linux-py3.12")

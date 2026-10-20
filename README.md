@@ -114,8 +114,8 @@ The full set is in `build_parser` and `Registry.from_env` in `mirror.py`.
 |---|---|---|---|
 | With `--prune`, `publish`, `export`, `import` | `MIRROR_GITLAB_API_URL` | `$CI_API_V4_URL` | `https://gitlab.example.com/api/v4`; the flag is `--api-url` |
 | Same | `MIRROR_PROJECT` | `$CI_PROJECT_ID` | Project path or id that holds the registry; the flag is `--project` |
-| Same | `MIRROR_TOKEN` | `$CI_JOB_TOKEN` | Token: `read_api` to export, `write_registry` to publish and import |
-| Optional | `MIRROR_USERNAME` | `__token__` | Registry user; `gitlab-ci-token` with a job token |
+| Same | `MIRROR_TOKEN` | `$CI_JOB_TOKEN` | Token: a deploy token with `read_package_registry` and `write_package_registry` does all but `export`, which needs `read_api` |
+| Optional | `MIRROR_USERNAME` | `__token__` | Registry user; `gitlab-ci-token` with a job token, the token's username with a deploy token |
 | Optional | `MIRROR_CA_BUNDLE` | system store | CA file for GitLab and NiFi; it replaces the system store, so it holds the full chain |
 | Optional | `MIRROR_MANYLINUX` | `2_28` | Newest glibc your Linux hosts run, as `2_<minor>`, minor 17 or newer |
 | Optional | `MIRROR_BUILD_RUNTIME` | `podman`, else `docker` | Container runtime that builds a wheel from an sdist; `none` builds with this machine's pip |
@@ -135,6 +135,7 @@ The full set is in `build_parser` and `Registry.from_env` in `mirror.py`.
 | Optional | `MIRROR_WHEELHOUSE_DIR` | `wheelhouse/` | Where `download` puts wheels, on a large disk; `publish` also uploads what is committed to `wheelhouse/` |
 | Optional | `MIRROR_PUBLISH_SDISTS` | `false` | Also publish, request and export the `.tar.gz`/`.zip` sdists in `wheelhouse/`; the high side then needs build tools for them |
 | Optional | `MIRROR_SYNC` (CI) | unset | `true` on Run pipeline runs `sync` now |
+| Optional | `MIRROR_SKIP_TESTS` (CI) | unset | `true` skips the `test` job, so publish and sync run without it |
 | Optional | `PYTHON_IMAGE` (CI) | `python:3.12-slim` | Job image with Python, or with curl, unzip and sha256sum |
 | Optional | `HTTPS_PROXY`, `NO_PROXY`, `PIP_INDEX_URL`, `PIP_CERT` | unset | pip's own settings for reaching PyPI |
 
