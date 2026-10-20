@@ -290,11 +290,16 @@ def name_and_version(filename: str) -> tuple:
     return parts[0], parts[1]
 
 
+METADATA_LIMIT = 4 << 20  # torch's METADATA is 40 KB; a few MB is any real one, a zip bomb is not
+
+
 def read_metadata(path: Path) -> Dict[str, str]:
     """The core metadata headers of a wheel, or {} when it has none."""
     try:
         with zipfile.ZipFile(path) as archive:
-            member = next((n for n in archive.namelist() if n.endswith(".dist-info/METADATA")), None)
+            member = next((i for i in archive.infolist() if i.filename.endswith(".dist-info/METADATA")), None)
+            if member and member.file_size > METADATA_LIMIT:
+                raise MirrorError(f"{path.name}: METADATA is {member.file_size} bytes, more than {METADATA_LIMIT}")
             raw = archive.read(member) if member else b""
     except zipfile.BadZipFile as error:
         with open(path, "rb") as handle:
@@ -353,6 +358,13 @@ def size_hint(code: int, detail: str, size: int) -> str:
     return ""
 
 
+def refuse_cleartext(url: str, what: str) -> None:
+    """A credential goes over https, or plain http only to this machine (tests, a local proxy)."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" and parsed.hostname not in ("127.0.0.1", "::1", "localhost"):
+        raise MirrorError(f"{url}: refusing to send {what} over {parsed.scheme or 'no scheme'}; use https")
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None  # surface the 3xx as an HTTPError instead of following it
@@ -362,6 +374,7 @@ class Registry:
     """The PyPI endpoints of one GitLab project's package registry."""
 
     def __init__(self, api_url: str, project: str, username: str, token: str, ca_bundle: Optional[str]):
+        refuse_cleartext(api_url, "the registry token")
         project_ref = urllib.parse.quote(project, safe="") if not project.isdigit() else project
         self.project_api = f"{api_url.rstrip('/')}/projects/{project_ref}"
         self.base = f"{self.project_api}/packages/pypi"
@@ -656,18 +669,25 @@ def post_bundle(path: Path, url: str, kind: str) -> None:
     progress(f"posted {path.name} to {url}")
 
 
+PLAIN_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._+-]*")
+
+
 def read_bundle(path: Path, into: Path) -> List[Tuple[Path, str]]:
     """Verify a bundle and its checksum, unpack it, and return (wheel, sha256) pairs."""
     sidecar = path.with_name(path.name + ".sha256")
     if sidecar.is_file() and sidecar.read_text().split()[0] != sha256_file(path):
         raise MirrorError(f"{path.name}: checksum does not match {sidecar.name}")
-    with tarfile.open(path) as tar:
+    with tarfile.open(path, "r:") as tar:
         for member in tar.getmembers():
             if not (member.isfile() or member.isdir()) or member.name.startswith("/") or ".." in Path(member.name).parts:
                 raise MirrorError(f"{path.name}: refusing unsafe entry {member.name!r}")
-        tar.extractall(into)
+        # The data filter (3.9.17 and later) also drops set-uid bits and refuses links and devices.
+        tar.extractall(into, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
     manifest = json.loads((into / "MANIFEST.json").read_text())
     out = []
+    for entry in [*manifest["files"], *manifest.get("requirements", [])]:
+        if not all(PLAIN_NAME.fullmatch(part) for part in str(entry.get("file", "")).split("/")):
+            raise MirrorError(f"{path.name}: refusing manifest entry {entry.get('file')!r}")
     for entry in manifest["files"]:
         wheel = into / "wheels" / entry["file"]
         if not wheel.is_file() or sha256_file(wheel) != entry["sha256"]:
@@ -942,13 +962,17 @@ def disk_bytes(*folders: Path) -> int:
     return total
 
 
+SECRET_NAME = re.compile(r"TOKEN|PASSWORD|PASSWD|SECRET|JWT|CREDENTIAL|_KEY$|^AWS_|^VAULT_", re.IGNORECASE)
+
+
 def run_streamed(command: List[str], stop_on: Optional[str] = None) -> Tuple[int, List[str]]:
     """Run a command, stream its output to stderr, and return its exit code and output lines.
 
     pip goes quiet while it downloads one large file or runs a build. After HEARTBEAT seconds
     without output, a line says how long it has run and how much has reached the disk.
     A line matching the stop_on pattern ends the command: retrying cannot help."""
-    env = dict(os.environ)
+    # pip runs setup.py of every sdist it builds: it sees no token of this job.
+    env = {name: value for name, value in os.environ.items() if not SECRET_NAME.search(name)}
     env.setdefault("TMPDIR", str(scratch()))
     if "PIP_CACHE_DIR" not in env:
         # The wheelhouse is the cache: pip's own would hold a second copy of every
@@ -1234,7 +1258,7 @@ class Ledger:
         request = urllib.request.Request(self.url, data=data, method=method)
         # A job token reads and writes its own project's generic packages; the REST API wants it as JOB-TOKEN.
         request.add_header("JOB-TOKEN" if self.registry.job_token else "PRIVATE-TOKEN", self.registry.token)
-        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=self.registry.context))
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=self.registry.context), _NoRedirect())
         try:
             with opener.open(request, timeout=120) as response:
                 return response.read()
@@ -1316,6 +1340,7 @@ def post_request(body: Dict[str, object], url: str) -> None:
                **ci_attributes()}
     token = os.environ.get("MIRROR_REQUEST_TOKEN", "").strip()
     if token:
+        refuse_cleartext(url, "MIRROR_REQUEST_TOKEN")
         headers["Authorization"] = f"Bearer {token}"
     target = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
     try:

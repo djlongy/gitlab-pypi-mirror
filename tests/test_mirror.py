@@ -764,6 +764,49 @@ class BundleTests(CliMixin, FakeRegistry):
         self.assertNotEqual(mirror.canonical_version("2.3.4"), mirror.canonical_version("2.3.4.post1"))
 
 
+class HardeningTests(unittest.TestCase):
+    """What a hostile wheel, bundle or endpoint must not get from the mirror."""
+
+    def test_a_token_never_goes_over_plain_http_except_to_this_machine(self):
+        with self.assertRaisesRegex(mirror.MirrorError, "over http"):
+            mirror.Registry("http://gitlab.example.com/api/v4", "1", "__token__", "t", None)
+        mirror.Registry("http://127.0.0.1:1/api/v4", "1", "__token__", "t", None)
+        with mock.patch.dict(os.environ, {"MIRROR_REQUEST_TOKEN": "t"}), \
+                self.assertRaisesRegex(mirror.MirrorError, "over http"):
+            mirror.post_request({"registry": "r", "files": []}, "http://nifi.example.com/pypi-request")
+
+    def test_a_build_sees_no_token_of_the_job(self):
+        secret = {"MIRROR_TOKEN": "t", "CI_JOB_TOKEN": "t", "CI_JOB_JWT_V2": "t", "MIRROR_REQUEST_TOKEN": "t",
+                  "AWS_SECRET_ACCESS_KEY": "t", "VAULT_ADDR": "t", "SSH_PRIVATE_KEY": "t", "KEEP_ME": "yes"}
+        with mock.patch.dict(os.environ, secret):
+            code, out = mirror.run_streamed([sys.executable, "-c", "import os; print(sorted(os.environ))"])
+        self.assertEqual(code, 0)
+        names = " ".join(out)
+        self.assertIn("KEEP_ME", names)
+        for name in secret.keys() - {"KEEP_ME"}:
+            self.assertNotIn(f"'{name}'", names)
+
+    def test_a_huge_metadata_is_refused_before_it_is_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bomb-1.0-py3-none-any.whl"
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("bomb-1.0.dist-info/METADATA", b"A" * (mirror.METADATA_LIMIT + 1))
+            with self.assertRaisesRegex(mirror.MirrorError, "METADATA is"):
+                mirror.read_metadata(path)
+
+    def test_a_manifest_naming_a_file_outside_the_bundle_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            manifest = json.dumps({"files": [{"file": "../../etc/passwd", "sha256": "0" * 64}]}).encode()
+            with tarfile.open(tmp / "b.tar", "w") as tar:
+                info = tarfile.TarInfo("MANIFEST.json")
+                info.size = len(manifest)
+                tar.addfile(info, io.BytesIO(manifest))
+            (tmp / "out").mkdir()
+            with self.assertRaisesRegex(mirror.MirrorError, "refusing manifest entry"):
+                mirror.read_bundle(tmp / "b.tar", tmp / "out")
+
+
 if __name__ == "__main__":
     unittest.main()
 

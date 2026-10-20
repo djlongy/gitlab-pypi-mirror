@@ -3,7 +3,7 @@
 
 usage: flow.py --side low|high|request-low|request-high [--url https://nifi:8443] [--user admin]
                [--password-stdin | --client-cert PEM --client-key PEM] [--ca-file PEM]
-               [--param name=value] [--connect-diode GROUP] [--insecure] [--export FILE]
+               [--param name=value] [--connect-diode GROUP] [--ca-file PEM] [--export FILE]
 
 Bundles (mirror.py publish -t / export POST one tar):
 low:  ListenHTTP :#{pypi.port}/contentListener -> PutFile #{pypi.dest}   (the diode's ingress directory)
@@ -47,14 +47,12 @@ SECRETS = {"request-low": {"gitlab.low.token": "GITLAB_LOW_TOKEN"},
 
 
 class Nifi:
-    def __init__(self, url, user, password, verify_tls, ca_file=None, client_cert=None, client_key=None):
+    def __init__(self, url, user, password, ca_file=None, client_cert=None, client_key=None):
         self.api = url.rstrip("/") + "/nifi-api"
         self.user, self.password, self.token, self.types = user, password, None, {}
         self.ctx = ssl.create_default_context(cafile=ca_file)
         if client_cert:
             self.ctx.load_cert_chain(client_cert, client_key)
-        if not verify_tls:
-            self.ctx.check_hostname, self.ctx.verify_mode = False, ssl.CERT_NONE
 
     def login(self):
         if not self.password:
@@ -326,7 +324,11 @@ def build(n, side, params, secrets=None, diode=None):
                               # ListenHTTP takes the Filename header as the filename on its own;
                               # X-Sha256, X-Artifact-* and X-Bundle-Kind become attributes
                               "HTTP Headers for Attributes": "(?i)x-.*"})
-        n.connect(pg, listen, put, ["success"])
+        # The Filename header is the sender's: without a path in it, PutFile cannot write outside #{pypi.dest}.
+        name = n.processor(pg, "UpdateAttribute", "plain file name", 1,
+                           {"filename": "${filename:replaceAll('[^A-Za-z0-9._-]', '_')}"})
+        n.connect(pg, listen, name, ["success"])
+        n.connect(pg, name, put, ["success"])
     else:
         ls = n.processor(pg, "ListFile", "list bundles", 0,
                          {"Input Directory": "#{pypi.source}", "File Filter": r"pypi-.*\.tar",
@@ -349,7 +351,6 @@ def main(argv=None):
     ap.add_argument("--user", default=os.environ.get("NIFI_USER", "admin"))
     ap.add_argument("--password-stdin", action="store_true", help="read the password from the first line of stdin (else NIFI_PASSWORD)")
     ap.add_argument("--param", action="append", default=[], help="pypi.port=, pypi.source= or pypi.dest=")
-    ap.add_argument("--insecure", action="store_true", help="skip TLS verification (self-signed NiFi)")
     ap.add_argument("--ca-file", help="CA bundle that signed NiFi's certificate")
     ap.add_argument("--client-cert", help="log in with this client certificate (PEM) instead of a password")
     ap.add_argument("--client-key", help="the client certificate's key (PEM)")
@@ -365,8 +366,7 @@ def main(argv=None):
     empty = [SECRETS[args.side][name] for name, value in secrets.items() if not value]
     if empty:
         ap.error(f"set {', '.join(empty)}: the GitLab token becomes a sensitive parameter")
-    n = Nifi(args.url, args.user, "" if args.client_cert else password, not args.insecure,
-             args.ca_file, args.client_cert, args.client_key)
+    n = Nifi(args.url, args.user, "" if args.client_cert else password, args.ca_file, args.client_cert, args.client_key)
     n.login()
     pg = build(n, args.side, params, secrets, args.connect_diode)
     print(f"pypi {args.side} running in process group {pg}: {params}")

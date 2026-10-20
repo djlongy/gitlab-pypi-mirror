@@ -75,10 +75,13 @@ sync:
     GIT_DEPTH: "0"  # MIRROR_BUNDLE_GIT bundles the full history
   script:
     - python3 mirror.py download
-    - python3 mirror.py publish -t delta
-    # With MIRROR_REQUEST_URL, the low NiFi fetches each new wheel from the registry itself.
+    # With MIRROR_REQUEST_URL, the low NiFi fetches each new wheel from the registry itself, so no
+    # bundle is written: a delta of large wheels is more than GitLab takes as an artifact (HTTP 413).
     - |
-      if [ -n "$MIRROR_REQUEST_URL" ]; then
+      if [ -z "$MIRROR_REQUEST_URL" ]; then
+        python3 mirror.py publish -t delta
+      else
+        python3 mirror.py publish
         if [ -n "$MIRROR_RESEND_PACKAGES" ]; then
           printf '%s\n' "$MIRROR_RESEND_PACKAGES" | python3 mirror.py request -T -
         else
@@ -93,7 +96,7 @@ sync:
       - .last-bundle
   artifacts:
     name: pypi-delta-$CI_PIPELINE_ID
-    when: always  # a bundle NiFi refused is still downloadable
+    when: always  # a bundle NiFi refused is still downloadable; none with MIRROR_REQUEST_URL
     paths:
       - delta/
     expire_in: 14 days

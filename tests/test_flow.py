@@ -157,7 +157,7 @@ class LayoutTests(unittest.TestCase):
 
     class Fake(flow.Nifi):
         def __init__(self):
-            super().__init__("https://nifi", "", "", True)
+            super().__init__("https://nifi", "", "")
             self.types = {"org.apache.nifi.processors.standard.X": {}}
             self.made, self.lines, self.names = 0, [], {}
 
