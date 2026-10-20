@@ -1170,6 +1170,150 @@ def cmd_publish(args) -> int:
     return 0
 
 
+# --- request: ask the low NiFi to fetch each wheel itself -------------------------
+#
+# A bundle can exceed what the low NiFi accepts in one POST. A request is a small JSON
+# list of wheels already in the registry; the low NiFi downloads each one from the
+# registry and sends it across the link as its own FlowFile. The ledger records what
+# was requested, so each wheel is asked for once, and a failed POST is asked for again.
+
+LEDGER_PACKAGE, LEDGER_VERSION, LEDGER_NAME = "pypi-mirror-ledger", "v1", "ledger.json"
+REQUEST_TYPE = "python-packages-request"
+
+
+class Ledger:
+    """What request has asked the low NiFi for: {file name: sha256}. In a GitLab CI job (or with
+    MIRROR_LEDGER=gitlab) a file in the project's generic packages, so nothing lives on the runner;
+    else MIRROR_LEDGER or .mirror-ledger.json beside mirror.py."""
+
+    def __init__(self, registry: "Registry"):
+        setting = os.environ.get("MIRROR_LEDGER", "").strip()
+        self.registry = registry
+        self.in_gitlab = setting.lower() == "gitlab" or (not setting and bool(os.environ.get("CI_JOB_TOKEN")))
+        self.path = None if self.in_gitlab else Path(setting or ROOT / ".mirror-ledger.json")
+        self.url = f"{registry.project_api}/packages/generic/{LEDGER_PACKAGE}/{LEDGER_VERSION}/{LEDGER_NAME}"
+
+    def _call(self, method: str, data: Optional[bytes] = None) -> Optional[bytes]:
+        request = urllib.request.Request(self.url, data=data, method=method)
+        # A job token reads and writes its own project's generic packages; the REST API wants it as JOB-TOKEN.
+        request.add_header("JOB-TOKEN" if self.registry.job_token else "PRIVATE-TOKEN", self.registry.token)
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=self.registry.context))
+        try:
+            with opener.open(request, timeout=120) as response:
+                return response.read()
+        except urllib.error.HTTPError as error:
+            if method == "GET" and error.code == 404:
+                return None
+            raise MirrorError(f"{method} {self.url}: HTTP {error.code}") from error
+        except urllib.error.URLError as error:
+            raise MirrorError(f"{method} {self.url}: {error.reason}") from error
+
+    def where(self) -> str:
+        return f"package {LEDGER_PACKAGE}/{LEDGER_VERSION}/{LEDGER_NAME}" if self.in_gitlab else str(self.path)
+
+    def load(self) -> Dict[str, str]:
+        raw = self._call("GET") if self.in_gitlab else (self.path.read_bytes() if self.path.is_file() else None)
+        if raw is None:
+            progress(f"ledger: none at {self.where()}, starting a new one")
+            return {}
+        data = json.loads(raw)
+        if data.get("registry") != self.registry.base:
+            raise MirrorError(f"the ledger at {self.where()} belongs to {data.get('registry')}, not "
+                              f"{self.registry.base}; set MIRROR_LEDGER to another file")
+        return dict(data.get("requested", {}))
+
+    def save(self, requested: Dict[str, str]) -> None:
+        body = json.dumps({"registry": self.registry.base, "requested": requested}, indent=1, sort_keys=True).encode()
+        if self.in_gitlab:
+            # ponytail: GitLab keeps every upload of the file and serves the newest; prune old ones if they pile up.
+            self._call("PUT", body)
+        else:
+            self.path.write_bytes(body)
+        progress(f"ledger: {self.where()} records {len(requested)} requested file(s)")
+
+
+def request_body(registry: "Registry", files: List[Path]) -> Dict[str, object]:
+    """The JSON the low NiFi reads: one entry per wheel, with the URL it downloads it from."""
+    entries = []
+    for path in files:
+        name, version = name_and_version(path.name)
+        digest = sha256_file(path)
+        entries.append({"filename": path.name, "name": name, "version": version, "sha256": digest,
+                        "size": path.stat().st_size,
+                        "url": f"{registry.base}/files/{digest}/{urllib.parse.quote(path.name)}"})
+    return {"registry": registry.base, "files": entries}
+
+
+def post_request(body: Dict[str, object], url: str) -> None:
+    """POST the request JSON with the same attribute headers a bundle carries, so the low NiFi routes it."""
+    data = json.dumps(body).encode()
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme == "https":
+        context = ssl.create_default_context(
+            cafile=os.environ.get("MIRROR_REQUEST_CA_BUNDLE") or os.environ.get("MIRROR_CA_BUNDLE") or None)
+        conn = http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=60, context=context)
+    else:
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=60)
+    headers = {"Content-Type": "application/json", "Content-Length": str(len(data)),
+               "Filename": f"pypi-request-{bundle_stamp()}.json", "X-Sha256": hashlib.sha256(data).hexdigest(),
+               "X-Artifact-Type": REQUEST_TYPE, "X-Artifact-Format": "json", "X-Artifact-Action": ARTIFACT_ACTION,
+               "X-File-Count": str(len(body["files"]))}
+    token = os.environ.get("MIRROR_REQUEST_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    target = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+    try:
+        conn.request("POST", target, body=data, headers=headers)
+        status = conn.getresponse().status
+    except OSError as error:
+        raise MirrorError(f"POST request to {url}: {error}") from error
+    finally:
+        conn.close()
+    if not 200 <= status < 300:
+        raise MirrorError(f"POST request to {url}: HTTP {status}")
+
+
+def cmd_request(args) -> int:
+    url = args.request_url or os.environ.get("MIRROR_REQUEST_URL", "").strip()
+    if not url:
+        raise UsageError("request needs --request-url or MIRROR_REQUEST_URL")
+    registry = Registry.from_env()
+    ledger = Ledger(registry)
+    requested = ledger.load()
+    specs = read_specs(args)
+    every = args.all or env_flag("MIRROR_RESEND_ALL")
+    wanted = []
+    for path in wheel_files():
+        name, version = name_and_version(path.name)
+        if specs:
+            if not any(normalize(SPEC_RE.fullmatch(spec)[1]) == normalize(name) and (
+                    not SPEC_RE.fullmatch(spec)[2]
+                    or canonical_version(SPEC_RE.fullmatch(spec)[2]) == canonical_version(version)) for spec in specs):
+                continue
+        elif not every and path.name in requested:
+            continue
+        if path.name not in registry.existing(name):  # the low NiFi downloads it from there
+            warn(f"{path.name} is not in the registry yet, not requested; run publish first")
+            continue
+        wanted.append(path)
+    if specs and not wanted:
+        raise MirrorError(f"nothing in {WHEELHOUSE}/ and the registry matches {', '.join(specs)}")
+    if not wanted:
+        progress("nothing new to request")
+        return 0
+    if args.dry_run:
+        for path in wanted:
+            print(f"would request {path.name}")
+        print(f"would post {len(wanted)} file(s) to {url}")
+        return 0
+    body = request_body(registry, wanted)
+    post_request(body, url)
+    progress(f"requested {len(wanted)} file(s) from {url}")
+    requested.update({entry["filename"]: entry["sha256"] for entry in body["files"]})
+    ledger.save(requested)
+    return 0
+
+
 def canonical_version(version: str) -> str:
     """A PEP 440 version in one spelling, so 2.3.4, 2.3.4.0 and 2.3.04 compare equal."""
     match = re.fullmatch(r"v?(\d+(?:\.\d+)*)(.*)", version.strip().lower())
@@ -1434,6 +1578,26 @@ def build_parser() -> argparse.ArgumentParser:
                          help="also write the files uploaded by this run to a tar in DIR")
     publish.add_argument("--nifi-url", metavar="URL",
                          help="with -t, also POST the tar to this NiFi ListenHTTP (or MIRROR_NIFI_URL)")
+    request = command("request", cmd_request, "ask the low NiFi to fetch new wheels from the registry, one by one",
+                      "  {prog} request\n  {prog} request -n\n  {prog} request numpy==2.3.4 pyspark\n  {prog} request --all",
+                      "which files: every wheel in wheelhouse/ the registry holds and the ledger has not recorded as\n"
+                      "requested; PACKAGE operands or -T files name them again whatever the ledger says, and --all (or\n"
+                      "MIRROR_RESEND_ALL) takes every one.\n"
+                      "what it sends: one POST of JSON {registry, files: [{filename, name, version, sha256, size, url}]}\n"
+                      "to --request-url (or MIRROR_REQUEST_URL), with Filename, X-Sha256, X-Artifact-Type\n"
+                      "python-packages-request, X-Artifact-Format json and X-File-Count headers; MIRROR_REQUEST_TOKEN is\n"
+                      "sent as Authorization: Bearer. The low NiFi downloads each url and sends each wheel on its own.\n"
+                      "what it writes: the ledger, after the POST succeeds: in CI the generic package\n"
+                      "pypi-mirror-ledger/v1/ledger.json of this project, else MIRROR_LEDGER or .mirror-ledger.json.\n"
+                      "-n prints 'would request FILE' and changes nothing.\n"
+                      "check it: the low NiFi's queues, then pip index versions <name> against the high registry.\n\n")
+    dry_flag(request, "print what would be requested")
+    request.add_argument("packages", nargs="*", metavar="PACKAGE", type=package_spec,
+                         help="request NAME or NAME==VERSION again, whatever the ledger says")
+    request.add_argument("-T", "--files-from", action="append", metavar="FILE",
+                         help="read more NAME[==VERSION] lines from FILE (- is stdin)")
+    request.add_argument("--all", action="store_true", help="every wheel the registry holds (or MIRROR_RESEND_ALL=true)")
+    request.add_argument("--request-url", metavar="URL", help="the low NiFi ListenHTTP (or MIRROR_REQUEST_URL)")
     prune = command("prune", cmd_prune, "remove local copies of wheels the registry already has",
                     "  {prog} prune\n  {prog} prune --dry-run",
                     "which files: wheels in wheelhouse/ that the registry's simple index lists. They are deleted here only;\n"

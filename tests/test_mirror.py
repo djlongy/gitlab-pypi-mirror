@@ -51,6 +51,8 @@ class FakeGitLab(BaseHTTPRequestHandler):
 
     def do_GET(self):
         getattr(self.server, "paths", []).append(self.path)
+        if "/packages/generic/" in self.path:
+            return self._generic()
         if "/packages?" in self.path or "/package_files" in self.path or "/packages/pypi/files/" in self.path:
             return self._packages_api()
         if self.path.startswith("/upstream/"):
@@ -109,8 +111,27 @@ class FakeGitLab(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(body).encode())
 
+    def _generic(self):
+        """GET and PUT of a generic package file: the request ledger. A job token arrives as JOB-TOKEN."""
+        if (self.headers.get("JOB-TOKEN") or self.headers.get("PRIVATE-TOKEN")) != TOKEN:
+            self.send_response(401)
+            self.end_headers()
+            return
+        if self.command == "PUT":
+            self.server.generic[self.path] = self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(201)
+            self.end_headers()
+            return
+        data = self.server.generic.get(self.path)
+        self.send_response(200 if data is not None else 404)
+        self.end_headers()
+        self.wfile.write(data or b"")
+
+    def do_PUT(self):
+        return self._generic()
+
     def do_POST(self):
-        if self.path == "/contentListener":  # stands in for NiFi's ListenHTTP
+        if self.path in ("/contentListener", "/pypi-request"):  # stands in for NiFi's ListenHTTP
             body = self.rfile.read(int(self.headers["Content-Length"]))
             self.server.posted.append((self.headers["filename"], self.headers["x-sha256"], body))
             self.server.post_headers.append(dict(self.headers.items()))  # names as sent
@@ -379,7 +400,7 @@ class FakeRegistry(Workspace):
         self.server = HTTPServer(("127.0.0.1", 0), FakeGitLab)
         self.server.forward = False
         self.server.posted, self.server.post_status, self.server.post_headers = [], 200, []
-        self.server.paths = []
+        self.server.paths, self.server.generic = [], {}
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)

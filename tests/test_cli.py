@@ -2,6 +2,7 @@
 
 import argparse
 import io
+import json
 import os
 import subprocess
 import sys
@@ -442,6 +443,73 @@ class CliTest(tm.CliMixin, tm.FakeRegistry):
         self.assertEqual(code, 0)
         self.assertEqual(lines, ["Collecting x", f"TMPDIR={mirror.ROOT / '.tmp'}", "cache=1"])
         self.assertIn("Collecting x", err.getvalue())
+
+    # request
+
+    def request_url(self):
+        return f"http://127.0.0.1:{self.server.server_port}/pypi-request"
+
+    def ledger(self):
+        raw = self.server.generic.get("/api/v4/projects/42/packages/generic/pypi-mirror-ledger/v1/ledger.json")
+        return json.loads(raw) if raw else None
+
+    def test_request_asks_once_for_each_wheel_the_registry_holds(self):
+        wheelhouse = self.target("linux-py3.12")
+        idna = tm.make_wheel(wheelhouse, "idna-3.20-py3-none-any.whl")
+        tm.make_wheel(wheelhouse, "requests-2.32.5-py3-none-any.whl")
+        self.assertEqual(self.run_cli("publish")[0], 0, self.err)
+        tm.make_wheel(wheelhouse, "six-1.17.0-py2.py3-none-any.whl")  # not published
+        code, out = self.run_cli("request", "--request-url", self.request_url())
+        self.assertEqual((code, out), (0, ""), self.err)
+        self.assertIn("six-1.17.0-py2.py3-none-any.whl is not in the registry yet", self.err)
+        (filename, sha, raw), = self.server.posted
+        headers = self.server.post_headers[0]
+        body = json.loads(raw)
+        self.assertEqual(sha, mirror.hashlib.sha256(raw).hexdigest())
+        self.assertEqual((headers["X-Artifact-Type"], headers["X-Artifact-Format"], headers["X-File-Count"]),
+                         ("python-packages-request", "json", "2"))
+        self.assertRegex(filename, r"^pypi-request-\d{8}T\d{9}Z\.json$")
+        entry = next(f for f in body["files"] if f["filename"] == idna.name)
+        self.assertEqual((entry["name"], entry["version"], entry["sha256"], entry["size"]),
+                         ("idna", "3.20", mirror.sha256_file(idna), idna.stat().st_size))
+        self.assertEqual(entry["url"], f"{body['registry']}/files/{entry['sha256']}/{idna.name}")
+        self.assertEqual(sorted(self.ledger()["requested"]), sorted(f["filename"] for f in body["files"]))
+        self.assertEqual(self.run_cli("request", "--request-url", self.request_url())[0], 0)
+        self.assertIn("nothing new to request", self.err)
+        self.assertEqual(len(self.server.posted), 1)
+        self.assertEqual(self.run_cli("request", "--request-url", self.request_url(), "idna==3.20")[0], 0)
+        self.assertEqual([f["filename"] for f in json.loads(self.server.posted[-1][2])["files"]], [idna.name])
+        self.assertEqual(self.run_cli("request", "--request-url", self.request_url(), "--all")[0], 0)
+        self.assertEqual(len(json.loads(self.server.posted[-1][2])["files"]), 2)
+
+    def test_a_failed_request_is_asked_for_again(self):
+        tm.make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")
+        self.run_cli("publish")
+        self.server.post_status = 503  # NiFi back pressure
+        code, _ = self.run_cli("request", "--request-url", self.request_url())
+        self.assertEqual(code, 1)
+        self.assertIn("HTTP 503", self.err)
+        self.assertIsNone(self.ledger())
+        self.server.post_status = 200
+        self.assertEqual(self.run_cli("request", "--request-url", self.request_url())[0], 0)
+        self.assertEqual(list(self.ledger()["requested"]), ["idna-3.20-py3-none-any.whl"])
+
+    def test_request_dry_run_posts_nothing_and_a_local_ledger_outside_ci(self):
+        tm.make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")
+        self.run_cli("publish")
+        os.environ["MIRROR_REQUEST_URL"] = self.request_url()
+        code, out = self.run_cli("request", "-n")
+        self.assertEqual((code, out), (0, f"would request idna-3.20-py3-none-any.whl\nwould post 1 file(s) to {self.request_url()}\n"))
+        self.assertEqual(self.server.posted, [])
+        local = Path(self.tmp.name) / "ledger.json"
+        os.environ["MIRROR_LEDGER"] = str(local)
+        self.assertEqual(self.run_cli("request")[0], 0, self.err)
+        self.assertEqual(list(json.loads(local.read_text())["requested"]), ["idna-3.20-py3-none-any.whl"])
+        self.assertIsNone(self.ledger())
+        self.assertEqual(self.run_cli("request", "nosuch")[0], 1)
+        self.assertIn("matches nosuch", self.err)
+        del os.environ["MIRROR_REQUEST_URL"]
+        self.assertEqual(self.run_cli("request")[0], 2)
 
     # publish
 
@@ -1051,7 +1119,7 @@ class ParserTreeTests(unittest.TestCase):
 
     def test_every_option_and_operand_has_help(self):
         found, commands = self.actions()
-        self.assertEqual(sorted(commands), ["check", "download", "export", "import", "list", "pin", "prune", "publish"])
+        self.assertEqual(sorted(commands), ["check", "download", "export", "import", "list", "pin", "prune", "publish", "request"])
         for command, action in found:
             if isinstance(action, (argparse._HelpAction, argparse._SubParsersAction)) or action.help == argparse.SUPPRESS:
                 continue

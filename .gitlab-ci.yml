@@ -83,6 +83,15 @@ sync:
   script:
     - python3 mirror.py download
     - python3 mirror.py publish -t delta
+    # With MIRROR_REQUEST_URL, the low NiFi fetches each new wheel from the registry itself.
+    - |
+      if [ -n "$MIRROR_REQUEST_URL" ]; then
+        if [ -n "$MIRROR_RESEND_PACKAGES" ]; then
+          printf '%s\n' "$MIRROR_RESEND_PACKAGES" | python3 mirror.py request -T -
+        else
+          python3 mirror.py request
+        fi
+      fi
   # Keeps the wheelhouse between runs on the same runner, so pip only fetches new files.
   cache:
     key: pypi-wheelhouse
