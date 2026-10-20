@@ -19,7 +19,23 @@ One `POST` to `MIRROR_REQUEST_URL`, body JSON:
 
 Headers, names as written: `Content-Type: application/json`, `Filename` (`pypi-request-<UTC>.json`),
 `X-Sha256` (of the body), `X-Artifact-Type: python-packages-request`, `X-Artifact-Format: json`,
-`X-Artifact-Action: mirror`, `X-File-Count`, and `Authorization: Bearer` when `MIRROR_REQUEST_TOKEN` is set.
+`X-Artifact-Action: mirror`, `X-File-Count`, `X-Registry` (the body's registry), `X-CI-Project`,
+`X-CI-Pipeline-Url` and `X-CI-Commit-Sha` in a pipeline (the same CI attributes as gitlab-registry-mirror's
+request, so one route or audit serves both), and `Authorization: Bearer` when `MIRROR_REQUEST_TOKEN` is set
+(https only).
+
+## Two ways to build the flows
+
+- **Python processors** (recommended): PlanPythonTransfer and RoutePythonTransfer from
+  nifi-python-package-processors (https://github.com/djlongy/nifi-python-package-processors) do the
+  checks this page builds from native processors, in 7 processors on the low side and 4 on the high
+  side. They read only the JSON and attributes; native
+  InvokeHTTP still moves every wheel. Their README and `docs/runbooks/pypi-transfer-build-by-hand.md`
+  give the flow, properties and TLS setup.
+- **Native processors only**: `flow.py --side request-low|request-high`, described below.
+
+Both take the same request and route on the same attributes. The high side receives each wheel with
+`X-Artifact-Type: python-packages`, so a RouteOnAttribute in front of either flow can split it off.
 
 ## The ledger
 
