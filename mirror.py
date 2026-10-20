@@ -221,7 +221,17 @@ def renovate_gaps(targets: List[Target]) -> List[str]:
 
 
 def wheelhouse() -> Path:
-    return ROOT / WHEELHOUSE
+    """Where downloads and builds land: MIRROR_WHEELHOUSE_DIR (a large disk, on a shell runner whose builds
+    directory is small), else wheelhouse/ in the checkout."""
+    return Path(os.environ.get("MIRROR_WHEELHOUSE_DIR") or ROOT / WHEELHOUSE)
+
+
+def shown(path: Path) -> str:
+    """path relative to the checkout when it is inside it."""
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
 
 
 def adopt_target_wheelhouses() -> None:
@@ -251,10 +261,17 @@ def wheel_files(dry_run: bool = False) -> List[Path]:
         files = sorted(seen.values())
     else:
         adopt_target_wheelhouses()
-        files = sorted(p for p in wheelhouse().iterdir() if p.is_file()) if wheelhouse().is_dir() else []
+        # Wheels committed to wheelhouse/ are published too when MIRROR_WHEELHOUSE_DIR is elsewhere:
+        # pushing a wheel there is the fallback when nothing else can fetch it.
+        seen = {}
+        for folder in dict.fromkeys([wheelhouse(), ROOT / WHEELHOUSE]):
+            for path in (sorted(folder.iterdir()) if folder.is_dir() else []):
+                if path.is_file():
+                    seen.setdefault(path.name, path)
+        files = sorted(seen.values())
     for path in files:
         if not path.name.endswith(".whl"):
-            warn(f"ignoring {path.relative_to(ROOT)}: only wheels are published")
+            warn(f"ignoring {shown(path)}: only wheels are published")
     return [p for p in files if p.name.endswith(".whl")]
 
 
@@ -705,6 +722,24 @@ def scratch() -> Path:
     return path
 
 
+STALE_SECONDS = 12 * 3600
+
+
+def sweep_scratch() -> None:
+    """Remove what a killed run left in the staging directory (a half-built sdist can be gigabytes).
+    Only entries untouched for 12 hours: another project's job may share MIRROR_STAGING_DIR."""
+    cutoff, removed = time.time() - STALE_SECONDS, 0
+    for path in scratch().iterdir():
+        try:
+            if path.lstat().st_mtime < cutoff:
+                shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+                removed += 1
+        except OSError as error:
+            warn(f"could not remove {path}: {error}")
+    if removed:
+        progress(f"removed {removed} stale item(s) from {scratch()}")
+
+
 MARKER_MACHINE = {"x86_64": "x86_64", "aarch64": "aarch64", "amd64": "AMD64", "arm64": "ARM64", "win32": "x86"}
 
 
@@ -1108,6 +1143,7 @@ def cmd_pin(args) -> int:
 
 
 def cmd_download(args) -> int:
+    sweep_scratch()
     adopt_target_wheelhouses()
     targets = find_targets(args.targets)
     skipped = {target.name: pip_download(target) for target in targets}
@@ -1247,6 +1283,22 @@ def request_body(registry: "Registry", files: List[Path]) -> Dict[str, object]:
     return {"registry": registry.base, "files": entries}
 
 
+# The same CI attributes as gitlab-registry-mirror's request, so one RouteOnAttribute or audit serves both.
+CI_ATTRIBUTES = {"X-CI-Project": "CI_PROJECT_PATH", "X-CI-Pipeline-Url": "CI_PIPELINE_URL",
+                 "X-CI-Commit-Sha": "CI_COMMIT_SHA"}
+
+
+def header_value(value: object) -> str:
+    """A value safe in an HTTP header and so a NiFi attribute: CR and LF removed."""
+    return re.sub(r"[\r\n]", "", str(value)).strip()
+
+
+def ci_attributes() -> Dict[str, str]:
+    """The CI_* variables that are set and non-empty, as attributes; none outside GitLab CI."""
+    found = {name: header_value(os.environ.get(variable, "")) for name, variable in CI_ATTRIBUTES.items()}
+    return {name: value for name, value in found.items() if value}
+
+
 def post_request(body: Dict[str, object], url: str) -> None:
     """POST the request JSON with the same attribute headers a bundle carries, so the low NiFi routes it."""
     data = json.dumps(body).encode()
@@ -1260,7 +1312,8 @@ def post_request(body: Dict[str, object], url: str) -> None:
     headers = {"Content-Type": "application/json", "Content-Length": str(len(data)),
                "Filename": f"pypi-request-{bundle_stamp()}.json", "X-Sha256": hashlib.sha256(data).hexdigest(),
                "X-Artifact-Type": REQUEST_TYPE, "X-Artifact-Format": "json", "X-Artifact-Action": ARTIFACT_ACTION,
-               "X-File-Count": str(len(body["files"]))}
+               "X-Registry": header_value(body["registry"]), "X-File-Count": str(len(body["files"])),
+               **ci_attributes()}
     token = os.environ.get("MIRROR_REQUEST_TOKEN", "").strip()
     if token:
         headers["Authorization"] = f"Bearer {token}"

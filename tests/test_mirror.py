@@ -15,6 +15,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 import zipfile
@@ -463,6 +464,30 @@ class RegistryTests(CliMixin, FakeRegistry):
         self.assertIn("1 file(s): 1 uploaded", self.err)
         self.assertNotIn("pkg", FakeGitLab.files)
         self.assertIn("ignoring wheelhouse/pkg-0.1.tar.gz", self.err)
+
+    def test_a_wheelhouse_elsewhere_and_the_committed_one_are_both_published(self):
+        """A shell runner keeps downloads on a large disk; a wheel pushed to wheelhouse/ still goes."""
+        committed = self.target("linux-py3.12")
+        make_wheel(committed, "idna-3.20-py3-none-any.whl")
+        elsewhere = Path(self.tmp.name) / "big-disk"
+        elsewhere.mkdir()
+        make_wheel(elsewhere, "six-1.17.0-py2.py3-none-any.whl")
+        make_wheel(elsewhere, "idna-3.20-py3-none-any.whl")
+        with mock.patch.dict(os.environ, {"MIRROR_WHEELHOUSE_DIR": str(elsewhere)}):
+            code, out = self.run_cli("publish")
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 file(s): 2 uploaded", self.err)
+
+    def test_download_removes_only_stale_leftovers_from_the_staging_directory(self):
+        staging = Path(self.tmp.name) / "staging"
+        (staging / "pip-build-old").mkdir(parents=True)
+        (staging / "pip-build-old" / "big.tar").write_bytes(b"x")
+        (staging / "current").mkdir()
+        old = time.time() - mirror.STALE_SECONDS - 60
+        os.utime(staging / "pip-build-old", (old, old))
+        with mock.patch.dict(os.environ, {"MIRROR_STAGING_DIR": str(staging)}):
+            mirror.sweep_scratch()
+        self.assertEqual(sorted(p.name for p in staging.iterdir()), ["current"])
 
     def test_a_git_lfs_pointer_is_named_as_one(self):
         """A runner without git-lfs checks out pointer files under the wheels' names."""

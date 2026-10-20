@@ -469,6 +469,7 @@ class CliTest(tm.CliMixin, tm.FakeRegistry):
         self.assertEqual((headers["X-Artifact-Type"], headers["X-Artifact-Format"], headers["X-File-Count"]),
                          ("python-packages-request", "json", "2"))
         self.assertRegex(filename, r"^pypi-request-\d{8}T\d{9}Z\.json$")
+        self.assertEqual(headers["X-Registry"], body["registry"])  # as gitlab-registry-mirror's request
         entry = next(f for f in body["files"] if f["filename"] == idna.name)
         self.assertEqual((entry["name"], entry["version"], entry["sha256"], entry["size"]),
                          ("idna", "3.20", mirror.sha256_file(idna), idna.stat().st_size))
