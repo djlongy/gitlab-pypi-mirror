@@ -282,7 +282,9 @@ class TargetTests(CliMixin, Workspace):
         with pip, redirect_stdout(io.StringIO()):
             mirror.cmd_pin(mock.Mock(path=None, dry_run=False))
         command = commands[0]
-        self.assertEqual(command[1:4], ["-m", "pip", "download"])
+        self.assertEqual(command[1:3], ["-c", mirror.PIP_AS_TARGET])
+        self.assertEqual(json.loads(command[3])["python_version"], "3.11")
+        self.assertEqual(command[4], "download")
         for flag in ("--dry-run", "--report", "--target", "install"):
             self.assertNotIn(flag, command)
         self.assertNotEqual(mirror.wheelhouse(), Path(command[command.index("--dest") + 1]))
@@ -294,6 +296,18 @@ class TargetTests(CliMixin, Workspace):
         self.assertEqual(platforms, mirror.linux_platforms(mirror.manylinux(), "x86_64"))
         self.assertEqual((self.packages / "linux-py3.11" / "requirements.txt").read_text(),
                          "requests[socks]==2.32.5\n", "dependencies are downloaded but never pinned")
+
+    def test_pip_judges_environment_markers_as_the_target(self):
+        """A Linux host downloading for Windows must not pull Linux-only dependencies."""
+        (self.packages / "windows-py3.10").mkdir()
+        target = mirror.Target(self.packages / "windows-py3.10")
+        script = ("from pip._vendor.packaging.markers import Marker\n"
+                  "print(Marker('platform_system == \"Linux\"').evaluate(), "
+                  "Marker('sys_platform == \"win32\" and python_version == \"3.10\"').evaluate())\n")
+        stub = mirror.PIP_AS_TARGET.replace('runpy.run_module("pip", run_name="__main__", alter_sys=True)', script)
+        result = subprocess.run([sys.executable, "-c", stub, mirror.pip_as(target)[3]],
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.split(), ["False", "True"])
 
     def test_a_failed_resolution_leaves_requirements_alone(self):
         self.target("linux-py3.9", "requests\nnumpy\n")

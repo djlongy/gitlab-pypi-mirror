@@ -705,9 +705,50 @@ def scratch() -> Path:
     return path
 
 
-def run_pip(args: List[str], stop_on: Optional[str] = None) -> Tuple[int, List[str]]:
-    """Run this Python's pip, streaming its output to stderr; returns its exit code and output lines."""
-    return run_streamed([sys.executable, "-m", "pip", "--disable-pip-version-check", *args], stop_on)
+MARKER_MACHINE = {"x86_64": "x86_64", "aarch64": "aarch64", "amd64": "AMD64", "arm64": "ARM64", "win32": "x86"}
+
+
+def target_markers(target: Target) -> Dict[str, str]:
+    """The environment-marker values pip on the target machine would see (PEP 508)."""
+    windows = target.os == "windows"
+    return {
+        "os_name": "nt" if windows else "posix",
+        "sys_platform": "win32" if windows else "linux",
+        "platform_system": "Windows" if windows else "Linux",
+        "platform_machine": MARKER_MACHINE[target.arch],
+        "python_version": target.python,
+        "python_full_version": f"{target.python}.0",
+        "implementation_name": "cpython",
+        "implementation_version": f"{target.python}.0",
+        "platform_python_implementation": "CPython",
+    }
+
+
+# pip judges environment markers (platform_system == "Linux", python_version < "3.11") by
+# the machine it runs on: --platform and --python-version change only which wheel tags fit.
+# A Linux runner downloading for Windows then needs xgboost's Linux-only nvidia-nccl-cu12,
+# which has no Windows wheel. This stub makes pip judge every marker as the target would.
+PIP_AS_TARGET = """import json, runpy, sys
+from pip._vendor.packaging import markers
+target = json.loads(sys.argv.pop(1))
+host = markers.default_environment
+markers.default_environment = lambda: {**host(), **target}
+sys.argv[0] = "pip"
+runpy.run_module("pip", run_name="__main__", alter_sys=True)
+"""
+
+
+def pip_as(target: Target) -> List[str]:
+    """The command that starts pip with the target's environment markers."""
+    return [sys.executable, "-c", PIP_AS_TARGET, json.dumps(target_markers(target))]
+
+
+def run_pip(args: List[str], stop_on: Optional[str] = None,
+            target: Optional[Target] = None) -> Tuple[int, List[str]]:
+    """Run this Python's pip, as the target when given, streaming its output to stderr.
+    Returns its exit code and output lines."""
+    pip = pip_as(target) if target else [sys.executable, "-m", "pip"]
+    return run_streamed([*pip, "--disable-pip-version-check", *args], stop_on)
 
 
 # This machine refused to open or run a file. Old pip (21.3, EL9's) then tries every older
@@ -785,7 +826,7 @@ def resolve(target: Target, pending: List[str], options: List[str], pending_file
         command = ["download", "--dest", str(wheelhouse()), "--progress-bar", "off",
                    "--find-links", str(wheelhouse()), "-r", str(pending_file)] + target_flags(target)
         progress(f"==> {target.name}: {len(pending)} requirement(s): pip {' '.join(command)}")
-        code, out = run_pip(command)
+        code, out = run_pip(command, target=target)
         if code == 0:
             return skipped
         stop_when_out_of_space(target, out)
@@ -1004,7 +1045,7 @@ def pip_resolve(target: Target, requirements: Path, names: List[str]) -> Dict[st
     # pip download, not pip install --dry-run --report: those need pip 22.2, and
     # EL9's stock pip is 21.3.1. The wheels land in a temporary directory only.
     with tempfile.TemporaryDirectory() as tmp:
-        command = [sys.executable, "-m", "pip", "download", "--quiet", "--disable-pip-version-check",
+        command = pip_as(target) + ["download", "--quiet", "--disable-pip-version-check",
                    "--dest", tmp, "-r", str(requirements), "--only-binary=:all:",
                    "--python-version", target.python, "--implementation", "cp"]
         for platform in target.platforms:

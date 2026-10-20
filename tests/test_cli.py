@@ -261,7 +261,7 @@ class CliTest(tm.CliMixin, tm.FakeRegistry):
         wheel for the target (one in the wheelhouse counts, as --find-links does)."""
         calls = []
 
-        def run_pip(args, stop_on=None):
+        def run_pip(args, stop_on=None, target=None):
             calls.append(args)
             dest = Path(args[args.index("--dest") + 1]) if "--dest" in args else None
             if args[0] == "wheel":
