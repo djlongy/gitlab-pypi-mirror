@@ -41,6 +41,7 @@ import http.client
 import io
 import json
 import os
+import queue as queue_module
 import re
 import shutil
 import ssl
@@ -48,6 +49,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -71,6 +73,7 @@ ARCHES = {"linux": {"x86_64", "aarch64"}, "windows": {"amd64", "arm64", "win32"}
 ARTIFACT_TYPE = "python-packages"
 ARTIFACT_FORMAT = "tar"
 ARTIFACT_ACTION = "mirror"
+HEARTBEAT = float(os.environ.get("MIRROR_HEARTBEAT", "15"))  # seconds of pip silence before a progress line
 LAST_BUNDLE = ".last-bundle"  # what the last bundle carried besides wheels, kept in the CI cache
 
 
@@ -694,101 +697,299 @@ def target_flags(target: Target) -> List[str]:
     return flags
 
 
+def scratch() -> Path:
+    """Temporary files beside the wheelhouse. /tmp is often a small tmpfs, and fapolicyd or a
+    noexec mount there refuses a source build: one multi-GB wheel or one sdist fails the run."""
+    path = ROOT / ".tmp"
+    path.mkdir(exist_ok=True)
+    return path
+
+
+def run_pip(args: List[str], stop_on: Optional[str] = None) -> Tuple[int, List[str]]:
+    """Run this Python's pip, streaming its output to stderr; returns its exit code and output lines."""
+    return run_streamed([sys.executable, "-m", "pip", "--disable-pip-version-check", *args], stop_on)
+
+
+# This machine refused to open or run a file. Old pip (21.3, EL9's) then tries every older
+# release, unpacking each sdist: pyspark's is 450 MB. The next one is refused the same way.
+REFUSED = r"Operation not permitted|Permission denied"
+
+
+NO_MATCH_RE = re.compile(r"No matching distribution found for (\S+)")
+LINE_RE = re.compile(r"\(line (\d+)\)")
+
+
+def stop_when_out_of_space(target: Target, out: List[str]) -> None:
+    """A full disk is not a bad package: every later download would fail too, so stop."""
+    if any("No space left on device" in line or "[Errno 28]" in line for line in out):
+        raise MirrorError(
+            f"{target.name}: no space left on device, in {WHEELHOUSE}/ or pip's temporary directory "
+            f"{os.environ.get('TMPDIR') or scratch()}. Free space or set TMPDIR to a larger disk, then run "
+            f"download again; the wheels already in {WHEELHOUSE}/ are kept and not fetched again.")
+
+
+def last_error(out: List[str]) -> str:
+    errors = [line.strip() for line in out if line.lstrip().startswith("ERROR:") or "Error:" in line]
+    return errors[-1] if errors else (out[-1].strip() if out else "pip failed")
+
+
+def owner(spec: str, pending: List[str], options: List[str], out: List[str]) -> Optional[str]:
+    """The requirement line that pulls in this distribution: the line itself, or the line pip names."""
+    name = req_name(spec)
+    for line in pending:
+        if req_name(line) == name:
+            return line
+    for line in reversed(out):  # "Collecting foo>=1 (from bar==2->-r file (line 3))"
+        words = line.split()
+        if len(words) > 1 and words[0] == "Collecting" and req_name(words[1]) == name:
+            number = LINE_RE.search(line)
+            if number:
+                index = int(number[1]) - 1 - len(options)
+                if 0 <= index < len(pending):
+                    return pending[index]
+            break
+    return None
+
+
 def pip_download(target: Target) -> List[str]:
-    """Download every requirement of this target into the wheelhouse. Returns the lines it had to skip."""
-    wheelhouse().mkdir(exist_ok=True)
-    base = [sys.executable, "-m", "pip", "download", "--dest", str(wheelhouse()),
-            "--disable-pip-version-check", "--progress-bar", "off"]
+    """Download every requirement of this target into the wheelhouse. Returns the lines it skipped."""
     requirements = target.path / "requirements.txt"
     if not (requirements.is_file() and read_lines(requirements)):
         return []
-    # Wheels only, for every package and every dependency. A source
-    # distribution needs a compiler and build dependencies on the air-gapped
-    # host; a package with no wheel for this target fails the download here
-    # instead of failing the install there.
-    command = base + ["-r", str(requirements)] + target_flags(target)
-    progress(f"==> {target.name}: {' '.join(command[3:])}")
-    try:
-        subprocess.run(command, check=True)
-        return []
-    except subprocess.CalledProcessError:
-        warn(f"{target.name}: the whole-file download failed; retrying one requirement at a time")
+    wheelhouse().mkdir(exist_ok=True)
     lines = read_lines(requirements)
     options = [line for line in lines if line.startswith("-")]  # -i, --extra-index-url, -c ...
-    skipped = []
-    for line in (line for line in lines if not line.startswith("-")):
-        if not fetch_one(target, line, options):
-            skipped.append(line)
-            warn(f"{target.name}: skipped {line}: no wheel for {target.os} Python {target.python}, "
-                 f"and its source distribution did not build into a wheel that installs there.\n"
-                 f"  Fix one of: pin a release that has a wheel for this target "
-                 f"(https://pypi.org/project/{BARE_NAME_RE.match(line)[0]}/#files); "
-                 f"build the wheel on a {target.os} Python {target.python} machine with "
-                 f"'pip wheel --no-deps \"{line}\"' and copy it into {WHEELHOUSE}/; "
-                 f"or remove the line from {requirements.relative_to(ROOT)}.")
+    pending = [line for line in lines if not line.startswith("-")]
+    # Beside requirements.txt, so relative -r and -c paths resolve the same way.
+    pending_file = target.path / PENDING
+    try:
+        skipped = resolve(target, pending, options, pending_file, set())
+    finally:
+        pending_file.unlink(missing_ok=True)
+    for line, reason in skipped:
+        warn(f"{target.name}: skipped {line}: {reason}\n  Fix: {fix_hint(target, line)}")
+    return [line for line, _ in skipped]
+
+
+def resolve(target: Target, pending: List[str], options: List[str], pending_file: Path,
+            built: Set[str]) -> List[Tuple[str, str]]:
+    """Download these lines as one pip run. A line pip cannot satisfy is built from its sdist or skipped,
+    and the rest run again. Every file lands in the wheelhouse, so a rerun fetches nothing twice."""
+    skipped: List[Tuple[str, str]] = []
+    pending = list(pending)
+    while pending:
+        pending_file.write_text("\n".join(options + pending) + "\n")
+        # Wheels only, for the target's Python and platform: a source distribution needs a
+        # compiler and build dependencies on the air-gapped host. --find-links offers the
+        # wheels already here, so a wheel built below or copied in by hand is used.
+        command = ["download", "--dest", str(wheelhouse()), "--progress-bar", "off",
+                   "--find-links", str(wheelhouse()), "-r", str(pending_file)] + target_flags(target)
+        progress(f"==> {target.name}: {len(pending)} requirement(s): pip {' '.join(command)}")
+        code, out = run_pip(command)
+        if code == 0:
+            return skipped
+        stop_when_out_of_space(target, out)
+        found = NO_MATCH_RE.findall("\n".join(out))
+        spec = found[-1] if found else None
+        line = owner(spec, pending, options, out) if spec else None
+        if line is None and len(pending) == 1:
+            line = pending[0]
+        if line is None:
+            warn(f"{target.name}: pip failed ({last_error(out)}); trying each requirement on its own")
+            for one in pending:
+                skipped += resolve(target, [one], options, pending_file, built)
+            return skipped
+        if spec and req_name(spec) not in built:
+            built.add(req_name(spec))
+            reason = build_from_sdist(target, spec)
+            if reason is None:
+                continue  # the built wheel is in the wheelhouse now; the same lines run again
+        else:
+            reason = last_error(out)
+        if spec and req_name(spec) != req_name(line):
+            reason = f"it needs {spec}, and {reason}"
+        pending.remove(line)
+        skipped.append((line, reason))
     return skipped
 
 
+PENDING = ".requirements-pending.txt"
 BARE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
-def fetch_one(target: Target, line: str, options: List[str]) -> bool:
-    """One requirement and its dependencies into the wheelhouse: its wheel, else a wheel built from its sdist.
-
-    Every file lands in a temporary directory first, so a requirement that fails leaves nothing behind."""
-    pip = [sys.executable, "-m", "pip", "--disable-pip-version-check"]
-    with tempfile.TemporaryDirectory() as tmp:
-        work = Path(tmp)
-        spec = work / "requirement.txt"
-        spec.write_text("\n".join(options + [line]) + "\n")
-        got = work / "got"
-        try:
-            subprocess.run(pip + ["download", "--quiet", "--progress-bar", "off", "--dest", str(got),
-                                  "-r", str(spec)] + target_flags(target), check=True)
-        except subprocess.CalledProcessError:
-            if not build_from_sdist(target, spec, work, got):
-                return False
-        for path in got.iterdir():
-            if not (wheelhouse() / path.name).exists():
-                shutil.move(str(path), str(wheelhouse() / path.name))
-    return True
+def req_name(text: str) -> str:
+    """The canonical project name a requirement or pip spec starts with."""
+    match = BARE_NAME_RE.match(text.strip())
+    return canonical(match[0]) if match else text.strip()
 
 
-def build_from_sdist(target: Target, spec: Path, work: Path, got: Path) -> bool:
-    """Build a wheel from the requirement's sdist and download its dependencies as wheels for the target.
+def build_image(target: Target) -> str:
+    return os.environ.get("MIRROR_BUILD_IMAGE", "python:{python}-slim").format(python=target.python)
+
+
+def container_runtime() -> Optional[str]:
+    """podman or docker on PATH; MIRROR_BUILD_RUNTIME=none builds on this machine instead."""
+    wanted = os.environ.get("MIRROR_BUILD_RUNTIME", "")
+    if wanted == "none":
+        return None
+    for name in ([wanted] if wanted else ["podman", "docker"]):
+        if shutil.which(name):
+            return name
+    return None
+
+
+PIP_PASSTHROUGH = ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_TRUSTED_HOST",
+                   "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy")
+
+
+def build_command(target: Target, spec: str, built: Path) -> Tuple[Optional[str], List[str]]:
+    """How to build spec into built/: in a container of the target's Python when podman or docker
+    is here, else with this machine's pip. Returns (runtime or None, command)."""
+    runtime = container_runtime()
+    if runtime:
+        env = [arg for name in PIP_PASSTHROUGH if os.environ.get(name) for arg in ("-e", name)]
+        return runtime, [runtime, "run", "--rm", "-v", f"{built}:/w:Z", *env, build_image(target),
+                         "python", "-m", "pip", "wheel", "--disable-pip-version-check", "--no-deps",
+                         "--progress-bar", "off", "--wheel-dir", "/w", spec]
+    return None, []
+
+
+def disk_bytes(*folders: Path) -> int:
+    total = 0
+    for folder in folders:
+        for root, _, files in os.walk(folder):
+            for name in files:
+                try:
+                    total += os.lstat(os.path.join(root, name)).st_size
+                except OSError:
+                    pass  # pip renames and removes its temporary files as it goes
+    return total
+
+
+def run_streamed(command: List[str], stop_on: Optional[str] = None) -> Tuple[int, List[str]]:
+    """Run a command, stream its output to stderr, and return its exit code and output lines.
+
+    pip goes quiet while it downloads one large file or runs a build. After HEARTBEAT seconds
+    without output, a line says how long it has run and how much has reached the disk.
+    A line matching the stop_on pattern ends the command: retrying cannot help."""
+    env = dict(os.environ)
+    env.setdefault("TMPDIR", str(scratch()))
+    if "PIP_CACHE_DIR" not in env:
+        # The wheelhouse is the cache: pip's own would hold a second copy of every
+        # wheel in ~/.cache/pip, and torch with its CUDA wheels alone is gigabytes.
+        env.setdefault("PIP_NO_CACHE_DIR", "1")
+    lines: List[str] = []
+    try:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+                                text=True, errors="replace")
+    except OSError as exc:
+        return 127, [f"ERROR: {exc}"]
+    queue: "queue_module.Queue[Optional[str]]" = queue_module.Queue()
+
+    def read() -> None:
+        for line in proc.stdout:
+            queue.put(line)
+        queue.put(None)
+
+    threading.Thread(target=read, daemon=True).start()
+    folders = [scratch(), wheelhouse()]
+    start, before = time.monotonic(), disk_bytes(*folders)
+    with proc:
+        while True:
+            try:
+                line = queue.get(timeout=HEARTBEAT)
+            except queue_module.Empty:
+                if not QUIET:
+                    elapsed = int(time.monotonic() - start)
+                    grown = max(0, disk_bytes(*folders) - before) // (1 << 20)
+                    last = lines[-1].strip()[:120] if lines else command[0]
+                    print(f"    ... still running after {elapsed // 60}m{elapsed % 60:02d}s, "
+                          f"{grown} MB written so far; last: {last}", file=sys.stderr, flush=True)
+                continue
+            if line is None:
+                break
+            lines.append(line.rstrip("\n"))
+            if not QUIET:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+            if stop_on and re.search(stop_on, line) and proc.poll() is None:
+                proc.terminate()
+    return proc.returncode, lines
+
+
+def refused(out: List[str]) -> Optional[str]:
+    """The line where this machine refused to open or run a file: fapolicyd, noexec or permissions."""
+    lines = [line.strip() for line in out if re.search(REFUSED, line)]
+    return lines[-1] if lines else None
+
+
+def build_from_sdist(target: Target, spec: str) -> Optional[str]:
+    """Build a wheel from the sdist of spec into the wheelhouse. None when it worked, else why not.
 
     Only a wheel the target can install is kept: a pure-Python build (py3-none-any)
-    fits every target; a compiled one fits only the machine that built it."""
-    pip = [sys.executable, "-m", "pip", "--disable-pip-version-check"]
-    src, built = work / "src", work / "built"
-    progress(f"    {target.name}: no wheel for {spec.read_text().split()[-1]}, building one from its source distribution")
-    try:
-        # --no-deps lets --python-version pick a release the target's Python supports
-        # without --only-binary; the dependencies come as wheels below.
-        subprocess.run(pip + ["download", "--quiet", "--progress-bar", "off", "--dest", str(src), "--no-deps",
-                              "--no-binary=:all:", "--python-version", target.python, "-r", str(spec)], check=True)
-        sdists = sorted(src.iterdir())
-        if len(sdists) != 1:
-            return False
-        subprocess.run(pip + ["wheel", "--quiet", "--no-deps", "--wheel-dir", str(built), str(sdists[0])], check=True)
-    except subprocess.CalledProcessError:
-        return False
-    wheels = sorted(built.glob("*.whl"))
-    if len(wheels) != 1:
-        return False
-    if not wheel_fits(wheels[0].name, target):
-        warn(f"{target.name}: built {wheels[0].name}, which is compiled for this machine, not for the target")
-        return False
-    try:
-        # The built wheel resolves its own dependencies, as wheels for the target.
-        subprocess.run(pip + ["download", "--quiet", "--progress-bar", "off", "--dest", str(got), str(wheels[0])]
-                       + target_flags(target), check=True)
-    except subprocess.CalledProcessError:
-        return False
-    got.mkdir(exist_ok=True)
-    if not (got / wheels[0].name).exists():
-        shutil.copy2(wheels[0], got / wheels[0].name)
-    return True
+    fits every target; a compiled one fits only the platform that built it."""
+    name = req_name(spec)
+    container_error = ""
+    with tempfile.TemporaryDirectory(dir=scratch()) as tmp:
+        src, built = Path(tmp) / "src", Path(tmp) / "built"
+        built.mkdir()
+        runtime, command = build_command(target, spec, built)
+        if runtime:
+            progress(f"==> {target.name}: no wheel of {spec} for {target.os} Python {target.python}; "
+                     f"building one from its source distribution in {runtime} {build_image(target)}")
+            code, out = run_streamed(command)
+            if code != 0:
+                stop_when_out_of_space(target, out)
+                if NO_MATCH_RE.search("\n".join(out)):
+                    return f"there is no wheel for {target.os} Python {target.python} and no source distribution"
+                container_error = f"{runtime} {build_image(target)}: {last_error(out)}"
+                warn(f"{target.name}: the build in {container_error}; trying this machine's pip")
+                runtime = None
+        if not runtime:
+            progress(f"==> {target.name}: no wheel of {spec} for {target.os} Python {target.python}; "
+                     f"building one from its source distribution with this machine's pip")
+            # --no-binary for this package only, so its build dependencies (setuptools) still come
+            # as wheels. --no-deps lets --python-version pick a release the target's Python supports.
+            code, out = run_pip(["download", "--no-deps", "--no-binary", name, "--python-version", target.python,
+                                 "--progress-bar", "off", "--dest", str(src), spec], stop_on=REFUSED)
+            if code == 0:
+                sdists = sorted(src.iterdir())
+                if len(sdists) != 1:
+                    return f"pip downloaded {len(sdists)} files for its source distribution, expected 1"
+                # The download machine's Python may be older than the target's; a pure-Python build does not care.
+                code, out = run_pip(["wheel", "--no-deps", "--ignore-requires-python", "--progress-bar", "off",
+                                     "--wheel-dir", str(built), str(sdists[0])], stop_on=REFUSED)
+            if code != 0:
+                stop_when_out_of_space(target, out)
+                if container_error:
+                    return (f"there is no wheel, the build in {container_error}, "
+                            f"and this machine's build failed too: {refused(out) or last_error(out)}")
+                denied = refused(out)
+                if denied:  # pip runs setup.py to read an sdist's metadata, before NO_MATCH below
+                    return (f"there is no wheel, and this machine refused to run its build ({denied}); "
+                            f"fapolicyd or a noexec mount blocks a package's setup code under "
+                            f"{os.environ.get('TMPDIR') or scratch()}")
+                if NO_MATCH_RE.search("\n".join(out)):
+                    return f"there is no wheel for {target.os} Python {target.python} and no source distribution"
+                return f"there is no wheel, and its source distribution did not build: {last_error(out)}"
+        wheels = sorted(built.glob("*.whl"))
+        if len(wheels) != 1:
+            return f"its source distribution built {len(wheels)} wheels, expected 1"
+        if not wheel_fits(wheels[0].name, target):
+            return f"there is no wheel, and its source builds {wheels[0].name}, which does not install on {target.name}"
+        shutil.copy2(wheels[0], wheelhouse() / wheels[0].name)
+        progress(f"    built {wheels[0].name} into {WHEELHOUSE}/")
+    return None
+
+
+def fix_hint(target: Target, line: str) -> str:
+    name = req_name(line)
+    return (f"pin a release with a wheel for {target.os} Python {target.python} (https://pypi.org/project/{name}/#files); "
+            f"or install podman or docker here and run download again, which builds a pure-Python package in "
+            f"{build_image(target)}; or build the wheel on a machine that allows it, for example "
+            f"podman run --rm -v \"$PWD/{WHEELHOUSE}:/w:Z\" {build_image(target)} pip wheel --no-deps '{line}' -w /w , "
+            f"and the next download uses it from {WHEELHOUSE}/; "
+            f"or remove the line from {(target.path / 'requirements.txt').relative_to(ROOT)}.")
 
 
 BARE_RE = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)(?P<extras>\[[^\]]*\])?\s*(?P<comment>#.*)?$")
@@ -1164,8 +1365,11 @@ def build_parser() -> argparse.ArgumentParser:
                        "  {prog} download\n  {prog} download linux-py3.12",
                        "which packages: every line of each target's requirements.txt and all their dependencies, as\n"
                        "wheels only, for that target's Python and platform tags (pip --only-binary=:all:). A package\n"
-                       "with no wheel (pyspark) is built from its sdist into a wheel, kept only if it installs on the\n"
-                       "target (py3-none-any); otherwise it is skipped with a warning that says how to fix it.\n"
+                       "with no wheel (pyspark) is built from its sdist in a podman or docker container of the target's\n"
+                       "Python (MIRROR_BUILD_IMAGE), else with this machine's pip, and kept only if it installs on the\n"
+                       "target (py3-none-any); otherwise it is skipped with a warning that says how to fix it. A wheel\n"
+                       "you copy into wheelhouse/ is used as is. pip's own output streams; when pip goes quiet, a line\n"
+                       "every MIRROR_HEARTBEAT seconds shows the time and MB written. A full disk stops the run.\n"
                        "sources: PyPI, or what pip reads from PIP_INDEX_URL, HTTPS_PROXY and PIP_CERT.\n"
                        "what it writes: wheelhouse/, one directory for all targets. A wheel already there is not fetched again.\n"
                        "check it: ls wheelhouse/ ; skipped lines are listed at the end, exit 0. Exit 1 when every line\n"

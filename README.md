@@ -69,7 +69,7 @@ HTTPS_PROXY=http://proxy.example.com:3128 NO_PROXY=gitlab.example.com ./sync.sh
 ```
 
 `sync.sh [TARGET...]` pulls, runs `download` into one `wheelhouse/`, commits and pushes; `--no-push` stops after the commit and `--prune` also runs `prune`.
-Only wheels are mirrored, with every dependency. A package that publishes only a source distribution, such as `pyspark`, is built into a wheel on the download machine; a pure-Python build (`py3-none-any`) installs on every target. A package whose build is compiled, or that has no usable release at all, is skipped with a warning that names the fix, and the rest of the sync continues. `download` exits 1 only when every line was skipped. Renovate updates `==` pins, one MR per Python version, and `pypi-mirror check` (the CI test job) fails when `renovate.json` does not hold a target to its Python. `pypi-mirror pin` pins bare names.
+Only wheels are mirrored, with every dependency. A package that publishes only a source distribution, such as `pyspark`, is built into a wheel in a container of the target's Python (podman or docker), or with this machine's pip when neither is installed; a pure-Python build (`py3-none-any`) installs on every target, and a wheel you copy into `wheelhouse/` is used as is. A package that still has no usable wheel is skipped with a warning that names the fix, and the rest of the sync continues. A full disk stops the run. `download` exits 1 only when every line was skipped. Renovate updates `==` pins, one MR per Python version, and `pypi-mirror check` (the CI test job) fails when `renovate.json` does not hold a target to its Python. `pypi-mirror pin` pins bare names.
 
 ## Run it in a pipeline
 
@@ -116,6 +116,9 @@ The full set is in `build_parser` and `Registry.from_env` in `mirror.py`.
 | Optional | `MIRROR_USERNAME` | `__token__` | Registry user; `gitlab-ci-token` with a job token |
 | Optional | `MIRROR_CA_BUNDLE` | system store | CA file for GitLab and NiFi; it replaces the system store, so it holds the full chain |
 | Optional | `MIRROR_MANYLINUX` | `2_28` | Newest glibc your Linux hosts run, as `2_<minor>`, minor 17 or newer |
+| Optional | `MIRROR_BUILD_RUNTIME` | `podman`, else `docker` | Container runtime that builds a wheel from an sdist; `none` builds with this machine's pip |
+| Optional | `MIRROR_BUILD_IMAGE` | `python:{python}-slim` | Build image, `{python}` is the target's version; point it at your internal registry |
+| Optional | `MIRROR_HEARTBEAT` | `15` | Seconds of pip silence before `download` prints elapsed time and MB written |
 | Optional | `MIRROR_BUNDLE_REQUIREMENTS` | `true` | Bundles carry each target's `requirements.txt` and `platforms.txt` |
 | Optional | `MIRROR_BUNDLE_GIT` | `false` | Bundles carry the git history; needs git in the job image and `GIT_DEPTH` 0 |
 | Optional | `MIRROR_NIFI_URL` | unset | Default of `--nifi-url`, e.g. `https://nifi.example.com:9099/contentListener` |

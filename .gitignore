@@ -4,3 +4,5 @@ __pycache__/
 .last-bundle
 .agent/
 .agents/
+.tmp/
+packages/*/.requirements-pending.txt

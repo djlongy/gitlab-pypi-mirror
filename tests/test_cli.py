@@ -9,6 +9,7 @@ import tarfile
 import tempfile
 import unittest
 import zipfile
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -253,91 +254,194 @@ class CliTest(tm.CliMixin, tm.FakeRegistry):
 
     # download
 
+    def fake_index(self, index):
+        """A fake pip over a fake index: {name: {"wheel", "sdist", "builds", "deps", "full"}}.
+
+        download -r writes each wheel as it resolves, like pip, and stops at the first name with no
+        wheel for the target (one in the wheelhouse counts, as --find-links does)."""
+        calls = []
+
+        def run_pip(args, stop_on=None):
+            calls.append(args)
+            dest = Path(args[args.index("--dest") + 1]) if "--dest" in args else None
+            if args[0] == "wheel":
+                entry = index[mirror.req_name(Path(args[-1]).name.split("-")[0])]
+                if entry["builds"] == "EPERM":
+                    return 1, ["PermissionError: [Errno 1] Operation not permitted: '/x/setup.py'",
+                               "ERROR: Failed to build"]
+                out = Path(args[args.index("--wheel-dir") + 1])
+                out.mkdir(parents=True, exist_ok=True)
+                (out / entry["builds"]).write_bytes(b"")
+                return 0, []
+            if "--no-binary" in args:
+                entry = index.get(mirror.req_name(args[-1]), {})
+                if not entry.get("sdist"):
+                    return 1, [f"ERROR: No matching distribution found for {args[-1]}"]
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / entry["sdist"]).write_bytes(b"")
+                return 0, []
+            lines = Path(args[args.index("-r") + 1]).read_text().splitlines()
+            out = []
+            for number, line in enumerate(lines, 1):
+                if line.startswith("-"):
+                    continue
+                todo = [(line, f"-r file (line {number})")]
+                while todo:
+                    spec, origin = todo.pop(0)
+                    out.append(f"Collecting {spec} (from {origin})")
+                    entry = index.get(mirror.req_name(spec), {})
+                    if entry.get("full"):
+                        return 1, out + ["OSError: [Errno 28] No space left on device: '/tmp/x.whl'"]
+                    have = [p.name for p in dest.iterdir() if mirror.req_name(p.name.split("-")[0]) == mirror.req_name(spec)]
+                    if not entry.get("wheel") and not have:
+                        return 1, out + [f"ERROR: No matching distribution found for {spec}"]
+                    if entry.get("wheel"):
+                        (dest / entry["wheel"]).write_bytes(b"")
+                    todo += [(dep, f"{spec}->-r file (line {number})") for dep in entry.get("deps", [])]
+            return 0, out
+
+        os.environ["MIRROR_BUILD_RUNTIME"] = "none"  # these tests build with the fake pip; see the container test
+        return calls, mock.patch.object(mirror, "run_pip", side_effect=run_pip)
+
+    def wheelhouse_names(self):
+        return sorted(p.name for p in mirror.wheelhouse().iterdir())
+
     def test_download_operands_reach_pip_and_pip_options_are_not_accepted(self):
         self.target("linux-py3.12", "idna\n")
         self.target("windows-py3.9", "idna\n")
-        commands = []
-
-        def run(command, check):
-            commands.append(command)
-
-        with mock.patch.object(mirror.subprocess, "run", side_effect=run):
+        calls, pip = self.fake_index({"idna": {"wheel": "idna-3.20-py3-none-any.whl"}})
+        with pip:
             code, out = self.run_cli("download", "windows-py3.9")
             self.assertEqual((code, out), (0, ""))
-            self.assertEqual(len(commands), 1)
-            self.assertEqual(commands[0][commands[0].index("--python-version") + 1], "3.9")
-            self.assertIn("==> windows-py3.9: download --dest", self.err)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][calls[0].index("--python-version") + 1], "3.9")
+            self.assertIn("--find-links", calls[0])
+            self.assertIn("==> windows-py3.9: 1 requirement(s): pip download --dest", self.err)
             self.assertEqual(self.run_cli("download", "--pip-arg", "--no-deps")[0], 2)
-            self.assertEqual(len(commands), 1)
+            self.assertEqual(len(calls), 1)
+        self.assertFalse((self.packages / "windows-py3.9" / mirror.PENDING).exists())
 
     def test_download_exits_1_when_every_requirement_is_skipped(self):
         self.target("linux-py3.12", "idna\n")
-
-        def run(command, check):
-            raise mirror.subprocess.CalledProcessError(1, command)
-
-        with mock.patch.object(mirror.subprocess, "run", side_effect=run):
+        _, pip = self.fake_index({})
+        with pip:
             code, out = self.run_cli("download")
         self.assertEqual((code, out), (1, ""))
         self.assertIn("every requirement was skipped (linux-py3.12: idna)", self.err)
+        self.assertIn("no wheel for linux Python 3.12 and no source distribution", self.err)
 
-    def pip(self, wheels, sdists=(), builds=None):
-        """A fake pip: download writes the named wheel (or sdist), wheel writes the built file."""
-        commands = []
-
-        def run(command, check):
-            commands.append(command)
-            if "wheel" in command:
-                out = Path(command[command.index("--wheel-dir") + 1])
-                out.mkdir(parents=True, exist_ok=True)
-                (out / builds[Path(command[-1]).name]).write_bytes(b"")
-                return
-            dest = Path(command[command.index("--dest") + 1])
-            if "-r" not in command:  # the built wheel resolving its dependencies
-                dest.mkdir(parents=True, exist_ok=True)
-                (dest / "py4j-0.10.9.9-py2.py3-none-any.whl").write_bytes(b"")
-                return
-            line = Path(command[command.index("-r") + 1]).read_text().split()[-1]
-            if "--no-binary=:all:" in command:
-                if line not in sdists:
-                    raise mirror.subprocess.CalledProcessError(1, command)
-                dest.mkdir(parents=True, exist_ok=True)
-                (dest / sdists[line]).write_bytes(b"")
-                return
-            if line not in wheels:  # also the whole-file attempt, whose -r is the real file
-                raise mirror.subprocess.CalledProcessError(1, command)
-            dest.mkdir(parents=True, exist_ok=True)
-            (dest / wheels[line]).write_bytes(b"")
-
-        return commands, mock.patch.object(mirror.subprocess, "run", side_effect=run)
-
-    def test_a_package_with_no_usable_wheel_is_skipped_with_a_fix_and_the_rest_download(self):
-        self.target("linux-py3.10", "idna==3.20\nnative==1.0\n")
-        _, pip = self.pip({"idna==3.20": "idna-3.20-py3-none-any.whl"},
-                          sdists={"native==1.0": "native-1.0.tar.gz"},
-                          builds={"native-1.0.tar.gz": "native-1.0-cp312-cp312-macosx_14_0_arm64.whl"})
+    def test_a_pure_python_sdist_is_built_and_its_dependencies_come_as_wheels(self):
+        self.target("windows-py3.10", "requests==2.32.5\npyspark>=4.0\n")
+        calls, pip = self.fake_index({
+            "requests": {"wheel": "requests-2.32.5-py3-none-any.whl"},
+            "pyspark": {"sdist": "pyspark-4.0.1.tar.gz", "builds": "pyspark-4.0.1-py2.py3-none-any.whl",
+                        "deps": ["py4j==0.10.9.9"]},
+            "py4j": {"wheel": "py4j-0.10.9.9-py2.py3-none-any.whl"},
+        })
         with pip:
             code, out = self.run_cli("download")
         self.assertEqual((code, out), (0, ""))
-        wheelhouse = sorted(p.name for p in mirror.wheelhouse().iterdir())
-        self.assertEqual(wheelhouse, ["idna-3.20-py3-none-any.whl"])
-        self.assertIn("compiled for this machine", self.err)
-        self.assertIn("skipped native==1.0", self.err)
-        self.assertIn("pip wheel --no-deps", self.err)
-        self.assertIn("1 requirement(s) skipped, the rest downloaded: linux-py3.10: native==1.0", self.err)
-
-    def test_a_pure_python_sdist_is_built_into_a_wheel_with_its_dependencies(self):
-        self.target("windows-py3.10", "pyspark==4.0.1\n")
-        commands, pip = self.pip({}, sdists={"pyspark==4.0.1": "pyspark-4.0.1.tar.gz"},
-                                 builds={"pyspark-4.0.1.tar.gz": "pyspark-4.0.1-py2.py3-none-any.whl"})
-        with pip:
-            code, out = self.run_cli("download")
-        self.assertEqual((code, out), (0, ""))
-        self.assertEqual(sorted(p.name for p in mirror.wheelhouse().iterdir()),
-                         ["py4j-0.10.9.9-py2.py3-none-any.whl", "pyspark-4.0.1-py2.py3-none-any.whl"])
-        sdist = next(c for c in commands if "--no-binary=:all:" in c)
+        self.assertEqual(self.wheelhouse_names(), ["py4j-0.10.9.9-py2.py3-none-any.whl",
+                                                   "pyspark-4.0.1-py2.py3-none-any.whl",
+                                                   "requests-2.32.5-py3-none-any.whl"])
+        sdist = next(c for c in calls if "--no-binary" in c)
+        self.assertEqual(sdist[sdist.index("--no-binary") + 1], "pyspark")  # setuptools still comes as a wheel
         self.assertEqual(sdist[sdist.index("--python-version") + 1], "3.10")
         self.assertNotIn("skipped", self.err)
+
+    def test_a_build_the_host_refuses_is_skipped_with_the_reason_and_the_rest_download(self):
+        self.target("linux-py3.10", "pyspark>=4.0\ntorch>=2.7\nnative==1.0\n")
+        _, pip = self.fake_index({
+            "pyspark": {"sdist": "pyspark-4.0.1.tar.gz", "builds": "EPERM"},
+            "torch": {"wheel": "torch-2.9.0-cp310-cp310-manylinux_2_28_x86_64.whl"},
+            "native": {"sdist": "native-1.0.tar.gz", "builds": "native-1.0-cp39-cp39-linux_x86_64.whl"},
+        })
+        with pip:
+            code, out = self.run_cli("download")
+        self.assertEqual((code, out), (0, ""))
+        self.assertEqual(self.wheelhouse_names(), ["torch-2.9.0-cp310-cp310-manylinux_2_28_x86_64.whl"])
+        self.assertIn("skipped pyspark>=4.0: there is no wheel, and this machine refused to run its build", self.err)
+        self.assertIn("fapolicyd", self.err)
+        self.assertIn("skipped native==1.0: there is no wheel, and its source builds native-1.0-cp39", self.err)
+        self.assertIn("pip wheel --no-deps 'pyspark>=4.0' -w /w", self.err)
+        self.assertIn("2 requirement(s) skipped, the rest downloaded", self.err)
+
+    def test_a_dependency_with_no_wheel_skips_the_line_that_needs_it(self):
+        self.target("linux-py3.12", "idna\napp==1.0\n")
+        _, pip = self.fake_index({
+            "idna": {"wheel": "idna-3.20-py3-none-any.whl"},
+            "app": {"wheel": "app-1.0-py3-none-any.whl", "deps": ["gone>=2"]},
+        })
+        with pip:
+            code, out = self.run_cli("download")
+        self.assertEqual(code, 0)
+        self.assertIn("skipped app==1.0: it needs gone>=2, and there is no wheel", self.err)
+
+    def test_a_full_disk_stops_the_download_instead_of_skipping_packages(self):
+        self.target("linux-py3.10", "torch>=2.7\nidna\n")
+        calls, pip = self.fake_index({"torch": {"wheel": "torch-2.9.0-py3-none-any.whl", "full": True}})
+        with pip:
+            code, out = self.run_cli("download")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("no space left on device", self.err)
+        self.assertIn("set TMPDIR to a larger disk", self.err)
+        self.assertFalse(any("--no-binary" in c for c in calls))
+        self.assertNotIn("skipped", self.err)
+
+    def test_an_sdist_builds_in_a_container_of_the_targets_python_when_podman_is_here(self):
+        self.target("linux-py3.10", "pyspark>=4.0\n")
+        _, pip = self.fake_index({"pyspark": {"sdist": "pyspark-4.2.0.tar.gz"}})
+        runs = []
+
+        def container(command):
+            runs.append(command)
+            built = Path(command[command.index("-v") + 1].split(":")[0])
+            (built / "pyspark-4.2.0-py2.py3-none-any.whl").write_bytes(b"")
+            return 0, []
+
+        with pip, mock.patch.dict(os.environ, {"MIRROR_BUILD_RUNTIME": "", "PIP_INDEX_URL": "https://pypi.example/simple"}), \
+                mock.patch.object(mirror.shutil, "which", side_effect=lambda n: f"/usr/bin/{n}" if n == "podman" else None), \
+                mock.patch.object(mirror, "run_streamed", side_effect=container):
+            code, out = self.run_cli("download")
+        self.assertEqual((code, out), (0, ""))
+        self.assertEqual(runs[0][:3], ["podman", "run", "--rm"])
+        self.assertIn("python:3.10-slim", runs[0])
+        self.assertEqual(runs[0][-1], "pyspark>=4.0")
+        self.assertIn("PIP_INDEX_URL", runs[0])  # the name only: podman reads the value from this environment
+        self.assertIn("pyspark-4.2.0-py2.py3-none-any.whl", self.wheelhouse_names())
+        self.assertIn("in podman python:3.10-slim", self.err)
+
+    def test_a_silent_command_gets_a_progress_line(self):
+        with mock.patch.object(mirror, "HEARTBEAT", 0.2):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                code, lines = mirror.run_streamed([sys.executable, "-c", "import time; print('Downloading big'); "
+                                                   "import sys; sys.stdout.flush(); time.sleep(1.5)"])
+        self.assertEqual((code, lines), (0, ["Downloading big"]))
+        self.assertRegex(err.getvalue(), r"\.\.\. still running after 0m0\ds, \d+ MB written so far; last: Downloading big")
+
+    def test_a_refused_line_stops_the_command_instead_of_letting_pip_retry(self):
+        script = "import sys, time; print('PermissionError: [Errno 1] Operation not permitted: setup.py'); sys.stdout.flush(); time.sleep(30)"
+        code, lines = mirror.run_streamed([sys.executable, "-c", script], stop_on=mirror.REFUSED)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(lines, ["PermissionError: [Errno 1] Operation not permitted: setup.py"])
+
+    def test_pip_output_streams_and_temporary_files_stay_out_of_tmp(self):
+        script = Path(self.tmp.name) / "fakepip.py"
+        script.write_text("import os, sys\nprint('Collecting x'); print('TMPDIR=' + os.environ['TMPDIR'])\n"
+                          "print('cache=' + os.environ.get('PIP_NO_CACHE_DIR', ''))\n")
+        popen = subprocess.Popen
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TMPDIR", None)
+            os.environ.pop("PIP_CACHE_DIR", None)
+            with mock.patch.object(mirror.subprocess, "Popen",
+                                   side_effect=lambda cmd, **kw: popen([sys.executable, str(script)], **kw)):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    code, lines = mirror.run_pip(["download"])
+        self.assertEqual(code, 0)
+        self.assertEqual(lines, ["Collecting x", f"TMPDIR={mirror.ROOT / '.tmp'}", "cache=1"])
+        self.assertIn("Collecting x", err.getvalue())
 
     # publish
 
