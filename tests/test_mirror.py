@@ -807,6 +807,42 @@ class HardeningTests(unittest.TestCase):
                 mirror.read_bundle(tmp / "b.tar", tmp / "out")
 
 
+class RequestContractTests(unittest.TestCase):
+    """The headers the NiFi processors route on. nifi-python-package-processors tests the same list against a request
+    captured from post_request (python/tests/fixtures/gitlab-pypi-mirror-request.json): change both together."""
+
+    HEADERS = ["Content-Type", "Filename", "X-Artifact-Action", "X-Artifact-Format", "X-Artifact-Type", "X-CI-Commit-Sha",
+               "X-CI-Pipeline-Url", "X-CI-Project", "X-File-Count", "X-Registry", "X-Sha256"]
+
+    def test_a_request_in_ci_carries_exactly_the_contract_headers(self):
+        seen = {}
+
+        class Listener(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.update(self.headers.items())
+                seen["body"] = self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Listener)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        body = {"registry": "https://gitlab.example.com/api/v4/projects/12/packages/pypi", "files": [{"filename": "a"}]}
+        ci = {"CI_PROJECT_PATH": "platform/pypi-mirror", "CI_PIPELINE_URL": "https://gitlab.example.com/p/1",
+              "CI_COMMIT_SHA": "a" * 40}
+        with mock.patch.dict(os.environ, ci):
+            mirror.post_request(body, f"http://127.0.0.1:{server.server_port}/pypi-request")
+        raw = seen.pop("body")
+        sent = {k: v for k, v in seen.items() if k.startswith("X-") or k in ("Filename", "Content-Type")}
+        self.assertEqual(sorted(sent), self.HEADERS)
+        self.assertEqual((sent["X-Artifact-Type"], sent["X-Registry"], sent["X-File-Count"], sent["X-CI-Project"]),
+                         ("python-packages-request", body["registry"], "1", "platform/pypi-mirror"))
+        self.assertEqual(sent["X-Sha256"], mirror.hashlib.sha256(raw).hexdigest())
+
+
 if __name__ == "__main__":
     unittest.main()
 
