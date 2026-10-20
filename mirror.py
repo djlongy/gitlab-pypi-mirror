@@ -248,7 +248,8 @@ def adopt_target_wheelhouses() -> None:
 
 
 def wheel_files(dry_run: bool = False) -> List[Path]:
-    """The wheels in the wheelhouse. Nothing else is ever published.
+    """The wheels in the wheelhouse, and its source distributions with MIRROR_PUBLISH_SDISTS. Nothing else is
+    ever published.
 
     A dry run leaves older per-target wheelhouses where they are and lists their files too."""
     if dry_run:
@@ -270,9 +271,10 @@ def wheel_files(dry_run: bool = False) -> List[Path]:
                     seen.setdefault(path.name, path)
         files = sorted(seen.values())
     for path in files:
-        if not path.name.endswith(".whl"):
-            warn(f"ignoring {shown(path)}: only wheels are published")
-    return [p for p in files if p.name.endswith(".whl")]
+        if not published(path.name):
+            warn(f"ignoring {shown(path)}: only wheels are published"
+                 + ("" if path.name.endswith(".whl") or not is_sdist(path.name) else " (MIRROR_PUBLISH_SDISTS=true adds sdists)"))
+    return [p for p in files if published(p.name)]
 
 
 # --- distribution files -------------------------------------------------------
@@ -283,7 +285,26 @@ def normalize(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+SDIST_SUFFIXES = (".tar.gz", ".zip")
+SDIST_RE = re.compile(r"([A-Za-z0-9][A-Za-z0-9._+!-]*)-([0-9][A-Za-z0-9._+!]*)")
+
+
+def is_sdist(filename: str) -> bool:
+    """A source distribution file name: name-version.tar.gz or .zip (PEP 625, and the older hyphenated names)."""
+    stem = next((filename[: -len(s)] for s in SDIST_SUFFIXES if filename.endswith(s)), "")
+    return bool(SDIST_RE.fullmatch(stem))
+
+
+def published(filename: str) -> bool:
+    """What publish, request and export carry: wheels, and sdists only with MIRROR_PUBLISH_SDISTS=true. Wheels
+    install on the high side without a compiler; an sdist makes pip build it there."""
+    return filename.endswith(".whl") or (is_sdist(filename) and env_flag("MIRROR_PUBLISH_SDISTS"))
+
+
 def name_and_version(filename: str) -> tuple:
+    if is_sdist(filename):
+        stem = next(filename[: -len(s)] for s in SDIST_SUFFIXES if filename.endswith(s))
+        return tuple(SDIST_RE.fullmatch(stem).groups())
     parts = filename[: -len(".whl")].split("-") if filename.endswith(".whl") else []
     if len(parts) not in (5, 6):
         raise MirrorError(f"{filename}: not a wheel file name")
@@ -294,7 +315,9 @@ METADATA_LIMIT = 4 << 20  # torch's METADATA is 40 KB; a few MB is any real one,
 
 
 def read_metadata(path: Path) -> Dict[str, str]:
-    """The core metadata headers of a wheel, or {} when it has none."""
+    """The core metadata headers of a wheel, or {} when it has none (an sdist: its name and version are enough)."""
+    if not path.name.endswith(".whl"):
+        return {}
     try:
         with zipfile.ZipFile(path) as archive:
             member = next((i for i in archive.infolist() if i.filename.endswith(".dist-info/METADATA")), None)
@@ -458,7 +481,7 @@ class Registry:
             packages = json.loads(self._get(url))
             for package in packages:
                 for item in self._files_of(package["id"]):
-                    if item["created_at"][:10] >= since and item["file_name"].endswith(".whl"):
+                    if item["created_at"][:10] >= since and published(item["file_name"]):
                         found.append({"file": item["file_name"], "sha256": item["file_sha256"]})
             if len(packages) < 100:
                 return sorted(found, key=lambda f: f["file"])
@@ -492,7 +515,7 @@ class Registry:
                         version and canonical_version(package["version"]) != canonical_version(version)):
                     continue
                 found += [{"file": item["file_name"], "sha256": item["file_sha256"]}
-                          for item in self._files_of(package["id"]) if item["file_name"].endswith(".whl")]
+                          for item in self._files_of(package["id"]) if published(item["file_name"])]
             if len(packages) < 100:
                 return sorted(found, key=lambda f: f["file"])
             page += 1
@@ -529,6 +552,8 @@ class Registry:
             "sha256_digest": sha256.hexdigest(),
             "md5_digest": md5.hexdigest(),
         }
+        if is_sdist(path.name):
+            fields.update(filetype="sdist", pyversion="source")
         requires_python = read_metadata(path).get("Requires-Python")
         if requires_python:
             fields["requires_python"] = requires_python

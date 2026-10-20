@@ -133,6 +133,7 @@ The full set is in `build_parser` and `Registry.from_env` in `mirror.py`.
 | Optional | `MIRROR_RESEND_ALL`, `MIRROR_RESEND_PACKAGES` (CI) | unset | `request` every wheel, or the `NAME[==VERSION]` lines given |
 | Optional | `MIRROR_EXPORT_SINCE` | unset | Default of `--since`; in a pipeline it runs the `export` job |
 | Optional | `MIRROR_WHEELHOUSE_DIR` | `wheelhouse/` | Where `download` puts wheels, on a large disk; `publish` also uploads what is committed to `wheelhouse/` |
+| Optional | `MIRROR_PUBLISH_SDISTS` | `false` | Also publish, request and export the `.tar.gz`/`.zip` sdists in `wheelhouse/`; the high side then needs build tools for them |
 | Optional | `MIRROR_SYNC` (CI) | unset | `true` on Run pipeline runs `sync` now |
 | Optional | `PYTHON_IMAGE` (CI) | `python:3.12-slim` | Job image with Python, or with curl, unzip and sha256sum |
 | Optional | `HTTPS_PROXY`, `NO_PROXY`, `PIP_INDEX_URL`, `PIP_CERT` | unset | pip's own settings for reaching PyPI |
@@ -146,7 +147,7 @@ Booleans take `1 yes y true t on` or `0 no n false f off`, in any case; anything
 
 ## Out of scope
 
-- Mirroring source distributions: a package without a wheel is built into one, never carried as an sdist.
+- Mirroring source distributions by default: a package without a wheel is built into one. `MIRROR_PUBLISH_SDISTS=true` also carries the `.tar.gz` and `.zip` sdists in `wheelhouse/`, which pip on the high side must then build.
 - Removing packages from the registry.
 - Scanning packages for vulnerabilities or licences.
 

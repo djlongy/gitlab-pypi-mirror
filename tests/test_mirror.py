@@ -383,11 +383,22 @@ class FileNameTests(unittest.TestCase):
             with self.subTest(filename):
                 self.assertEqual(mirror.name_and_version(filename), expected)
 
-    def test_a_source_distribution_is_not_a_package_name(self):
-        for filename in ("python-dateutil-2.8.2.tar.gz", "pkg-0.1.zip", "pkg-0.1-py3.whl"):
+    def test_a_source_distribution_names_its_project_and_version(self):
+        for filename, expected in (("python-dateutil-2.8.2.tar.gz", ("python-dateutil", "2.8.2")),
+                                   ("pkg-0.1.zip", ("pkg", "0.1")), ("pyreadline-2.1.zip", ("pyreadline", "2.1"))):
+            with self.subTest(filename):
+                self.assertEqual(mirror.name_and_version(filename), expected)
+        for filename in ("pkg-0.1-py3.whl", "pkg.tar.gz", "pkg-0.1.tar.bz2", "../x-1.0.zip"):
             with self.subTest(filename):
                 with self.assertRaises(mirror.MirrorError):
                     mirror.name_and_version(filename)
+
+    def test_sdists_are_published_only_when_asked(self):
+        for flag, expected in (("", False), ("false", False), ("true", True)):
+            with self.subTest(flag=flag), mock.patch.dict(os.environ, {"MIRROR_PUBLISH_SDISTS": flag}):
+                self.assertEqual(mirror.published("pycrc16-0.1.2.tar.gz"), expected)
+                self.assertTrue(mirror.published("six-1.17.0-py2.py3-none-any.whl"))
+                self.assertFalse(mirror.published("pkg-0.1.tar.bz2"))
 
     def test_normalize(self):
         self.assertEqual(mirror.normalize("Zope.Interface__x"), "zope-interface-x")
