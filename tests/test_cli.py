@@ -1074,7 +1074,10 @@ class SyncShellTests(unittest.TestCase):
     """sync.sh with a stub git and a stub interpreter, so no network and no repository are touched."""
 
     def setUp(self):
-        self.tmp = __import__("tempfile").TemporaryDirectory()
+        # Beside the checkout, not in /tmp: a noexec /tmp (a hardened runner) makes the shell skip the stubs.
+        checkout_tmp = Path(mirror.__file__).with_name(".tmp")
+        checkout_tmp.mkdir(exist_ok=True)
+        self.tmp = __import__("tempfile").TemporaryDirectory(dir=checkout_tmp)
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
         (root / "bin").mkdir()
