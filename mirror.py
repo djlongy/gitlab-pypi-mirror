@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
 """Mirror Python packages into a GitLab PyPI package registry.
 
-Two halves, one file, standard library only:
-
-  On a machine that can reach PyPI (directly or through an HTTP proxy):
-      %(prog)s download      pip-download every packages/<target>/requirements.txt
-      %(prog)s prune         remove local copies of wheels the registry already has
-
-  In GitLab CI, where the runner cannot reach PyPI:
-      %(prog)s publish       upload every downloaded file the registry lacks
-                              (-t DIR: also tar just those files for the high side)
-
-  Moving packages across an air gap:
-      %(prog)s export        tar every file the registry received since a date
-      %(prog)s import        verify a tar and upload what the registry here lacks
+  %(prog)s sync      pip download every packages/<target>/requirements.txt into wheelhouse/,
+                      build a wheel where PyPI has only an sdist, upload what the registry lacks,
+                      and with MIRROR_REQUEST_URL ask the low NiFi to fetch each new wheel
+  %(prog)s export    tar wheels from the registry, by package or by date, to carry by hand
+  %(prog)s import    verify a tar and upload what the registry here lacks
 
 A target is a directory under packages/ named <os>-py<X.Y>[-<arch>]:
 
@@ -21,12 +13,7 @@ A target is a directory under packages/ named <os>-py<X.Y>[-<arch>]:
   packages/windows-py3.9/requirements.txt
   packages/linux-py3.11-aarch64/requirements.txt
 
-Every target downloads into one wheelhouse/ at the top of the repository. A
-wheel's file name carries its Python and platform tags, so targets never
-collide and a pure-Python wheel is stored once. Run `%(prog)s list` to see how
-each directory name is read.
-
-Python 3.8 or newer.
+Python 3.8 or newer, standard library only.
 """
 
 from __future__ import annotations
@@ -34,7 +21,6 @@ from __future__ import annotations
 import argparse
 import base64
 import email.parser
-import fnmatch
 import hashlib
 import html
 import http.client
@@ -59,7 +45,7 @@ import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 ROOT = Path(__file__).resolve().parent
 PACKAGES = ROOT / "packages"
 WHEELHOUSE = "wheelhouse"
@@ -67,15 +53,10 @@ WHEELHOUSE = "wheelhouse"
 TARGET_RE = re.compile(r"^(?P<os>linux|windows)-py(?P<py>3\.\d{1,2})(?:-(?P<arch>[a-z0-9_]+))?$")
 DEFAULT_ARCH = {"linux": "x86_64", "windows": "amd64"}
 ARCHES = {"linux": {"x86_64", "aarch64"}, "windows": {"amd64", "arm64", "win32"}}
-# Newest glibc the Linux hosts have: 2_28 is RHEL 8 and later. pip does not
-# expand a PEP 600 tag to the older ones, so linux_platforms() lists them all.
-# X-Artifact-* on every NiFi POST, for RouteOnAttribute on a NiFi shared with other feeds.
-ARTIFACT_TYPE = "python-packages"
-ARTIFACT_FORMAT = "tar"
+# X-Artifact-Action on every request POST, for RouteOnAttribute on a NiFi shared with other feeds.
 ARTIFACT_ACTION = "mirror"
-HEARTBEAT = float(os.environ.get("MIRROR_HEARTBEAT", "15"))  # seconds of pip silence before a progress line
-LAST_BUNDLE = ".last-bundle"  # what the last bundle carried besides wheels, kept in the CI cache
-
+HEARTBEAT = 15.0  # seconds of pip silence before a progress line
+STAGING: Optional[Path] = None  # sync sets it: TMPDIR for pip and source builds
 
 class MirrorError(Exception):
     pass
@@ -155,10 +136,6 @@ class Target:
             return ["win32"] if self.arch == "win32" else [f"win_{self.arch}"]
         return linux_platforms(manylinux(), self.arch)
 
-    def definition(self) -> List[Path]:
-        """The files that say what this target needs: requirements.txt and platforms.txt."""
-        return [p for p in (self.path / "requirements.txt", self.path / "platforms.txt") if p.is_file()]
-
 
 def manylinux() -> str:
     return os.environ.get("MIRROR_MANYLINUX", "2_28")
@@ -193,33 +170,6 @@ def find_targets(only: Optional[List[str]] = None) -> List[Target]:
     return targets
 
 
-def renovate_gaps(targets: List[Target]) -> List[str]:
-    """Targets renovate.json does not hold to their Python version. No renovate.json, no gaps."""
-    path = ROOT / "renovate.json"
-    if not path.is_file():
-        return []
-    config = json.loads(path.read_text())
-    gaps = [] if config.get("constraintsFiltering") == "strict" else [
-        'renovate.json: set "constraintsFiltering": "strict", or Renovate ignores the Python constraints'
-    ]
-    for target in targets:
-        file = f"packages/{target.name}/requirements.txt"
-        pythons = sorted({
-            rule["constraints"]["python"] for rule in config.get("packageRules", [])
-            if "python" in rule.get("constraints", {})
-            and any(fnmatch.fnmatchcase(file, glob) for glob in rule.get("matchFileNames", []))
-        })
-        if pythons != [target.python]:
-            gaps.append(
-                f"packages/{target.name}: renovate.json gives Python {', '.join(pythons) or 'nothing'}, expected "
-                f"{target.python}. Add to packageRules: "
-                f'{{"groupName": "Python {target.python} packages", "matchFileNames": '
-                f'["packages/*-py{target.python}/**", "packages/*-py{target.python}-*/**"], '
-                f'"constraints": {{"python": "{target.python}"}}}}'
-            )
-    return gaps
-
-
 def wheelhouse() -> Path:
     """Where downloads and builds land: MIRROR_WHEELHOUSE_DIR (a large disk, on a shell runner whose builds
     directory is small), else wheelhouse/ in the checkout."""
@@ -234,42 +184,17 @@ def shown(path: Path) -> str:
         return str(path)
 
 
-def adopt_target_wheelhouses() -> None:
-    """Move packages/<target>/wheelhouse/ files into the shared wheelhouse, one copy per name."""
-    for old in sorted(PACKAGES.glob(f"*/{WHEELHOUSE}")):
-        wheelhouse().mkdir(exist_ok=True)
-        for path in old.iterdir():
-            if (wheelhouse() / path.name).exists():
-                path.unlink()  # a file name on PyPI never changes content
-            else:
-                path.replace(wheelhouse() / path.name)
-        old.rmdir()
-        progress(f"moved {old.relative_to(ROOT)}/ into {WHEELHOUSE}/")
-
-
-def wheel_files(dry_run: bool = False) -> List[Path]:
+def wheel_files() -> List[Path]:
     """The wheels in the wheelhouse, and its source distributions with MIRROR_PUBLISH_SDISTS. Nothing else is
-    ever published.
-
-    A dry run leaves older per-target wheelhouses where they are and lists their files too."""
-    if dry_run:
-        folders = [wheelhouse(), *sorted(PACKAGES.glob(f"*/{WHEELHOUSE}"))]
-        seen: Dict[str, Path] = {}
-        for folder in folders:
-            for path in (sorted(folder.iterdir()) if folder.is_dir() else []):
-                if path.is_file():
-                    seen.setdefault(path.name, path)
-        files = sorted(seen.values())
-    else:
-        adopt_target_wheelhouses()
-        # Wheels committed to wheelhouse/ are published too when MIRROR_WHEELHOUSE_DIR is elsewhere:
-        # pushing a wheel there is the fallback when nothing else can fetch it.
-        seen = {}
-        for folder in dict.fromkeys([wheelhouse(), ROOT / WHEELHOUSE]):
-            for path in (sorted(folder.iterdir()) if folder.is_dir() else []):
-                if path.is_file():
-                    seen.setdefault(path.name, path)
-        files = sorted(seen.values())
+    ever published."""
+    # Wheels committed to wheelhouse/ are published too when MIRROR_WHEELHOUSE_DIR is elsewhere:
+    # pushing a wheel there is the fallback when nothing else can fetch it.
+    seen: Dict[str, Path] = {}
+    for folder in dict.fromkeys([wheelhouse(), ROOT / WHEELHOUSE]):
+        for path in (sorted(folder.iterdir()) if folder.is_dir() else []):
+            if path.is_file():
+                seen.setdefault(path.name, path)
+    files = sorted(seen.values())
     for path in files:
         if not published(path.name):
             warn(f"ignoring {shown(path)}: only wheels are published"
@@ -591,33 +516,6 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def git(*args: str) -> str:
-    # safe.directory: in CI the checkout belongs to another uid than the job.
-    result = subprocess.run(["git", "-c", "safe.directory=*", "-C", str(ROOT), *args], capture_output=True, text=True)
-    if result.returncode:
-        raise MirrorError(f"git {args[0]}: {result.stderr.strip() or 'exit ' + str(result.returncode)}")
-    return result.stdout.strip()
-
-
-def extras() -> Tuple[List[Tuple[str, Path]], Optional[str]]:
-    """The requirement files and the commit a bundle carries, per MIRROR_BUNDLE_REQUIREMENTS (default on) and
-    MIRROR_BUNDLE_GIT (default off, needs git in the job image and a full clone: GIT_DEPTH 0)."""
-    wanted = env_flag("MIRROR_BUNDLE_REQUIREMENTS", True)
-    definitions = [(f"{t.name}/{p.name}", p) for t in find_targets() for p in t.definition()] if wanted else []
-    head = None
-    if env_flag("MIRROR_BUNDLE_GIT"):
-        if not shutil.which("git"):
-            raise MirrorError("MIRROR_BUNDLE_GIT is on and this job has no git: use an image with git, or turn MIRROR_BUNDLE_GIT off")
-        if git("rev-parse", "--is-shallow-repository") != "false":
-            raise MirrorError("MIRROR_BUNDLE_GIT is on and this is a shallow clone: set GIT_DEPTH to 0 for this job")
-        head = git("rev-parse", "HEAD")
-    return definitions, head
-
-
-def fingerprint(definitions: List[Tuple[str, Path]], head: Optional[str]) -> str:
-    return json.dumps([head] + [[name, sha256_file(p)] for name, p in definitions])
-
-
 def bundle_stamp() -> str:
     now = time.time()  # milliseconds keep two runs in one second apart, and the names sort in time order
     return time.strftime("%Y%m%dT%H%M%S", time.gmtime(now)) + f"{int(now * 1000) % 1000:03d}Z"
@@ -627,21 +525,14 @@ def bundle_name(kind: str, stamp: Optional[str] = None) -> str:
     return f"pypi-{kind}-{stamp or bundle_stamp()}.tar"
 
 
-def write_bundle(files: List[Path], out_dir: Path, kind: str,
-                 definitions: List[Tuple[str, Path]], head: Optional[str], name: Optional[str] = None) -> Path:
+def write_bundle(files: List[Path], out_dir: Path, kind: str, name: Optional[str] = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = bundle_stamp()
     path = out_dir / (name or bundle_name(kind, stamp))
     manifest = {"created": stamp, "kind": kind, "source": os.environ.get("CI_PROJECT_PATH", ""),
-                "commit": os.environ.get("CI_COMMIT_SHA", "") or head or "",
+                "commit": os.environ.get("CI_COMMIT_SHA", ""),
                 "files": [{"file": f.name, "sha256": sha256_file(f), "size": f.stat().st_size}
-                          for f in sorted(files, key=lambda f: f.name)],
-                "requirements": [{"file": name, "sha256": sha256_file(p)} for name, p in definitions]}
-    work = tempfile.TemporaryDirectory()
-    if head:
-        repo = Path(work.name) / "repo.bundle"
-        git("bundle", "create", str(repo), "HEAD")
-        manifest["git"] = {"file": "repo.bundle", "sha256": sha256_file(repo), "head": head}
+                          for f in sorted(files, key=lambda f: f.name)]}
     tmp = path.with_name("." + path.name + ".tmp")
     with tarfile.open(tmp, "w", format=tarfile.PAX_FORMAT) as tar:
         data = (json.dumps(manifest, indent=1) + "\n").encode()
@@ -650,48 +541,11 @@ def write_bundle(files: List[Path], out_dir: Path, kind: str,
         tar.addfile(info, fileobj=io.BytesIO(data))
         for f in sorted(files, key=lambda f: f.name):
             tar.add(f, arcname=f"wheels/{f.name}", recursive=False)
-        for name, p in definitions:
-            tar.add(p, arcname=f"requirements/{name}", recursive=False)
-        if head:
-            tar.add(repo, arcname="repo.bundle", recursive=False)
-    work.cleanup()
     os.replace(tmp, path)
     path.with_name(path.name + ".sha256").write_text(f"{sha256_file(path)}  {path.name}\n")
     total = sum(entry["size"] for entry in manifest["files"])
-    progress(f"bundle: {path} ({len(files)} file(s), {total / 1e6:.1f} MB{', git ' + head[:12] if head else ''})")
+    progress(f"bundle: {path} ({len(files)} file(s), {total / 1e6:.1f} MB)")
     return path
-
-
-def post_bundle(path: Path, url: str, kind: str) -> None:
-    """POST a bundle to NiFi's ListenHTTP, or anything else that takes a file in a POST body.
-
-    The X- headers become flowfile attributes when ListenHTTP's "HTTP Headers for Attributes"
-    regex matches them, named exactly as sent. http.client sends the names as written here;
-    urllib would rewrite them."""
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme == "https":
-        context = ssl.create_default_context(cafile=os.environ.get("MIRROR_CA_BUNDLE") or None)
-        if os.environ.get("MIRROR_NIFI_CLIENT_CERT"):
-            context.load_cert_chain(os.environ["MIRROR_NIFI_CLIENT_CERT"], os.environ.get("MIRROR_NIFI_CLIENT_KEY") or None)
-        conn = http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=600, context=context)
-    else:
-        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=600)
-    headers = {"Content-Type": "application/x-tar", "Content-Length": str(path.stat().st_size),
-               "Filename": path.name, "X-Sha256": sha256_file(path),
-               "X-Artifact-Type": ARTIFACT_TYPE, "X-Artifact-Format": ARTIFACT_FORMAT,
-               "X-Artifact-Action": ARTIFACT_ACTION, "X-Bundle-Kind": kind}
-    target = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
-    try:
-        with open(path, "rb") as body:
-            conn.request("POST", target, body=body, headers=headers)
-            status = conn.getresponse().status
-    except OSError as error:
-        raise MirrorError(f"POST {path.name} to {url}: {error}") from error
-    finally:
-        conn.close()
-    if not 200 <= status < 300:
-        raise MirrorError(f"POST {path.name} to {url}: HTTP {status}")
-    progress(f"posted {path.name} to {url}")
 
 
 PLAIN_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._+-]*")
@@ -710,45 +564,17 @@ def read_bundle(path: Path, into: Path) -> List[Tuple[Path, str]]:
         tar.extractall(into, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
     manifest = json.loads((into / "MANIFEST.json").read_text())
     out = []
-    for entry in [*manifest["files"], *manifest.get("requirements", [])]:
-        if not all(PLAIN_NAME.fullmatch(part) for part in str(entry.get("file", "")).split("/")):
-            raise MirrorError(f"{path.name}: refusing manifest entry {entry.get('file')!r}")
     for entry in manifest["files"]:
+        if not PLAIN_NAME.fullmatch(str(entry.get("file", ""))):
+            raise MirrorError(f"{path.name}: refusing manifest entry {entry.get('file')!r}")
         wheel = into / "wheels" / entry["file"]
         if not wheel.is_file() or sha256_file(wheel) != entry["sha256"]:
             raise MirrorError(f"{path.name}: {entry['file']} is missing or does not match its sha256")
         out.append((wheel, entry["sha256"]))
-    for entry in manifest.get("requirements", []):
-        if sha256_file(into / "requirements" / entry["file"]) != entry["sha256"]:
-            raise MirrorError(f"{path.name}: requirements/{entry['file']} does not match its sha256")
-    if "git" in manifest and sha256_file(into / "repo.bundle") != manifest["git"]["sha256"]:
-        raise MirrorError(f"{path.name}: repo.bundle does not match its sha256")
     return out
 
 
-# --- commands -----------------------------------------------------------------
-
-
-def cmd_list(args) -> int:
-    for target in find_targets(args.targets):
-        requirements = target.path / "requirements.txt"
-        print(
-            f"{target.name:28} python {target.python:5} {target.os:8} {target.arch:8} "
-            f"platforms={target.platforms[0]}{f' (+{len(target.platforms) - 1} older)' if len(target.platforms) > 1 else ''} "
-            f"requirements={len(read_lines(requirements)) if requirements.is_file() else 0}"
-        )
-    return 0
-
-
-def cmd_check(args) -> int:
-    """Silent when every target is readable and renovate.json holds each to its Python; each gap on stderr, exit 1."""
-    targets = find_targets(args.targets)
-    for target in targets:
-        target.platforms  # noqa: B018 - reading validates platforms.txt and MIRROR_MANYLINUX
-    gaps = renovate_gaps(targets)
-    for gap in gaps:
-        fail(gap)
-    return 1 if gaps else 0
+# --- sync: download -------------------------------------------------------------
 
 
 def target_flags(target: Target) -> List[str]:
@@ -760,29 +586,8 @@ def target_flags(target: Target) -> List[str]:
 
 
 def scratch() -> Path:
-    """Temporary files beside the wheelhouse. /tmp is often a small tmpfs, and fapolicyd or a
-    noexec mount there refuses a source build: one multi-GB wheel or one sdist fails the run."""
-    path = Path(os.environ.get("MIRROR_STAGING_DIR") or ROOT / ".tmp")
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-STALE_SECONDS = 12 * 3600
-
-
-def sweep_scratch() -> None:
-    """Remove what a killed run left in the staging directory (a half-built sdist can be gigabytes).
-    Only entries untouched for 12 hours: another project's job may share MIRROR_STAGING_DIR."""
-    cutoff, removed = time.time() - STALE_SECONDS, 0
-    for path in scratch().iterdir():
-        try:
-            if path.lstat().st_mtime < cutoff:
-                shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
-                removed += 1
-        except OSError as error:
-            warn(f"could not remove {path}: {error}")
-    if removed:
-        progress(f"removed {removed} stale item(s) from {scratch()}")
+    """TMPDIR for pip and source builds: the staging directory sync was given, else the system's."""
+    return STAGING or Path(tempfile.gettempdir())
 
 
 MARKER_MACHINE = {"x86_64": "x86_64", "aarch64": "aarch64", "amd64": "AMD64", "arm64": "ARM64", "win32": "x86"}
@@ -845,8 +650,8 @@ def stop_when_out_of_space(target: Target, out: List[str]) -> None:
     if any("No space left on device" in line or "[Errno 28]" in line for line in out):
         raise MirrorError(
             f"{target.name}: no space left on device, in {WHEELHOUSE}/ or pip's temporary directory "
-            f"{os.environ.get('TMPDIR') or scratch()}. Free space or set TMPDIR to a larger disk, then run "
-            f"download again; the wheels already in {WHEELHOUSE}/ are kept and not fetched again.")
+            f"{os.environ.get('TMPDIR') or scratch()}. Free space or pass --staging-dir on a larger disk, then run "
+            f"sync again; the wheels already in {WHEELHOUSE}/ are kept and not fetched again.")
 
 
 def last_error(out: List[str]) -> str:
@@ -1017,7 +822,7 @@ def run_streamed(command: List[str], stop_on: Optional[str] = None) -> Tuple[int
         queue.put(None)
 
     threading.Thread(target=read, daemon=True).start()
-    folders = [scratch(), wheelhouse()]
+    folders = [wheelhouse(), *([STAGING] if STAGING else [])]  # never walk all of the system's temp
     start, before = time.monotonic(), disk_bytes(*folders)
     with proc:
         while True:
@@ -1110,91 +915,19 @@ def build_from_sdist(target: Target, spec: str) -> Optional[str]:
 def fix_hint(target: Target, line: str) -> str:
     name = req_name(line)
     return (f"pin a release with a wheel for {target.os} Python {target.python} (https://pypi.org/project/{name}/#files); "
-            f"or install podman or docker here and run download again, which builds a pure-Python package in "
+            f"or install podman or docker here and run sync again, which builds a pure-Python package in "
             f"{build_image(target)}; or build the wheel on a machine that allows it, for example "
             f"podman run --rm -v \"$PWD/{WHEELHOUSE}:/w:Z\" {build_image(target)} pip wheel --no-deps '{line}' -w /w , "
-            f"and the next download uses it from {WHEELHOUSE}/; "
+            f"and the next sync uses it from {WHEELHOUSE}/; "
             f"or remove the line from {(target.path / 'requirements.txt').relative_to(ROOT)}.")
-
-
-BARE_RE = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)(?P<extras>\[[^\]]*\])?\s*(?P<comment>#.*)?$")
 
 
 def canonical(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def pip_resolve(target: Target, requirements: Path, names: List[str]) -> Dict[str, str]:
-    """The version pip would download for each of these names, as {canonical name: version}."""
-    # pip download, not pip install --dry-run --report: those need pip 22.2, and
-    # EL9's stock pip is 21.3.1. The wheels land in a temporary directory only.
-    with tempfile.TemporaryDirectory() as tmp:
-        command = pip_as(target) + ["download", "--quiet", "--disable-pip-version-check",
-                   "--dest", tmp, "-r", str(requirements), "--only-binary=:all:",
-                   "--python-version", target.python, "--implementation", "cp"]
-        for platform in target.platforms:
-            command += ["--platform", platform]
-        try:
-            subprocess.run(command, check=True)
-        except subprocess.CalledProcessError:
-            raise MirrorError(f"{target.name}: pip could not resolve {requirements.relative_to(ROOT)}") from None
-        found: Dict[str, Set[str]] = {}
-        for wheel in Path(tmp).glob("*.whl"):
-            name, version = name_and_version(wheel.name)
-            found.setdefault(canonical(name), set()).add(version)
-    wanted = {canonical(n) for n in names}
-    missing = sorted(n for n in wanted if n not in found)
-    if missing:
-        raise MirrorError(f"{target.name}: pip downloaded no wheel for {', '.join(missing)}")
-    several = sorted(f"{n} ({', '.join(sorted(found[n]))})" for n in wanted if len(found[n]) > 1)
-    if several:
-        raise MirrorError(f"{target.name}: pip downloaded more than one version of {', '.join(several)}")
-    return {n: found[n].pop() for n in wanted}
-
-
-def targets_in(paths: List[str]) -> List[Target]:
-    """The targets whose requirements.txt is one of these paths or anywhere under them."""
-    found: Dict[Path, Target] = {}
-    for given in paths:
-        path = Path(given).resolve()
-        if not path.exists():
-            raise MirrorError(f"{given}: no such file or directory")
-        files = sorted(path.rglob("requirements.txt")) if path.is_dir() else [path]
-        if not files or files[0].name != "requirements.txt":
-            raise MirrorError(f"{given}: no requirements.txt here")
-        for file in files:
-            if file.parent not in found:
-                found[file.parent] = Target(file.parent)
-    return list(found.values())
-
-
-def cmd_pin(args) -> int:
-    """Pin every bare package name to the newest release this target can install. Pinned lines are left alone."""
-    for target in targets_in(args.path or [str(PACKAGES)]):
-        requirements = target.path / "requirements.txt"
-        lines = requirements.read_text(encoding="utf-8-sig").splitlines() if requirements.is_file() else []
-        bare = [i for i, line in enumerate(lines) if BARE_RE.match(line.strip())]
-        if not bare:
-            progress(f"{target.name}: nothing to pin")
-            continue
-        versions = pip_resolve(target, requirements, [BARE_RE.match(lines[i].strip())["name"] for i in bare])
-        for i in bare:
-            match = BARE_RE.match(lines[i].strip())
-            pin = f"{match['name']}{match['extras'] or ''}=={versions[canonical(match['name'])]}"
-            lines[i] = f"{pin}  {match['comment']}" if match["comment"] else pin
-            if args.dry_run:
-                print(f"would pin {target.name}: {pin}")
-            else:
-                progress(f"{target.name}: {pin}")
-        if not args.dry_run:
-            requirements.write_text("\n".join(lines) + "\n")
-    return 0
-
-
-def cmd_download(args) -> int:
-    sweep_scratch()
-    adopt_target_wheelhouses()
-    targets = find_targets(args.targets)
+def download(targets: List[Target]) -> int:
+    """pip download every target into the wheelhouse. 1 when every requirement was skipped."""
     skipped = {target.name: pip_download(target) for target in targets}
     skips = [f"{name}: {line}" for name, lines in skipped.items() for line in lines]
     if not skips:
@@ -1210,49 +943,23 @@ def cmd_download(args) -> int:
     return 0
 
 
-def nifi_target(args) -> Optional[str]:
-    """Where to POST a bundle: --nifi-url, else MIRROR_NIFI_URL."""
-    return args.nifi_url or os.environ.get("MIRROR_NIFI_URL") or None
-
-
-def cmd_publish(args) -> int:
-    registry = Registry.from_env()
-    files = wheel_files(args.dry_run)
-    uploaded, skipped = [], 0
+def publish(registry: "Registry", dry_run: bool) -> Set[str]:
+    """Upload every wheelhouse file the registry lacks. Returns the names uploaded (or that would be)."""
+    files = wheel_files()
+    uploaded: Set[str] = set()
     for path in files:
-        filename = path.name
-        name, _ = name_and_version(filename)
-        if filename in registry.existing(name):
-            skipped += 1
+        name, _ = name_and_version(path.name)
+        if path.name in registry.existing(name):
             continue
-        if args.dry_run:
-            print(f"would upload {filename}")
+        if dry_run:
+            print(f"would upload {path.name}")
         else:
             registry.upload(path)
-            progress(f"uploaded {filename}")
-        uploaded.append(path)
-    verb = "to upload" if args.dry_run else "uploaded"
-    progress(f"{len(files)} file(s): {len(uploaded)} {verb}, {skipped} already in the registry")
-    if args.target_directory:
-        definitions, head = extras()
-        state, marker = fingerprint(definitions, head), ROOT / LAST_BUNDLE
-        carries_extras = bool(definitions or head)
-        if args.dry_run:
-            if uploaded or (carries_extras and (not marker.is_file() or marker.read_text() != state)):
-                print(f"would bundle {len(uploaded)} file(s) into {Path(args.target_directory) / bundle_name('delta')}")
-                if nifi_target(args):
-                    print(f"would post to {nifi_target(args)}")
-            else:
-                progress("bundle: nothing new, no bundle would be written")
-        elif uploaded or (carries_extras and (not marker.is_file() or marker.read_text() != state)):
-            bundle = write_bundle(uploaded, Path(args.target_directory), "delta", definitions, head)
-            print(bundle)
-            if nifi_target(args):
-                post_bundle(bundle, nifi_target(args), "delta")
-            marker.write_text(state)  # after the POST, so a failed one is retried by the next run
-        else:
-            progress("bundle: nothing new, no bundle written")
-    return 0
+            progress(f"uploaded {path.name}")
+        uploaded.add(path.name)
+    verb = "to upload" if dry_run else "uploaded"
+    progress(f"{len(files)} file(s): {len(uploaded)} {verb}, {len(files) - len(uploaded)} already in the registry")
+    return uploaded
 
 
 # --- request: ask the low NiFi to fetch each wheel itself -------------------------
@@ -1382,15 +1089,11 @@ def post_request(body: Dict[str, object], url: str) -> None:
         raise MirrorError(f"POST request to {url}: HTTP {status}")
 
 
-def cmd_request(args) -> int:
-    url = args.request_url or os.environ.get("MIRROR_REQUEST_URL", "").strip()
-    if not url:
-        raise UsageError("request needs --request-url or MIRROR_REQUEST_URL")
-    registry = Registry.from_env()
+def request(registry: "Registry", url: str, specs: List[str], every: bool, dry_run: bool,
+            pending: Set[str]) -> int:
+    """POST the wheels the ledger has not recorded as sent, or the ones named, to the low NiFi."""
     ledger = Ledger(registry)
     sent = ledger.load()
-    specs = read_specs(args)
-    every = args.all or env_flag("MIRROR_RESEND_ALL")
     wanted = []
     for path in wheel_files():
         name, version = name_and_version(path.name)
@@ -1401,8 +1104,8 @@ def cmd_request(args) -> int:
                 continue
         elif not every and path.name in sent:
             continue
-        if path.name not in registry.existing(name):  # the low NiFi downloads it from there
-            warn(f"{path.name} is not in the registry yet, not requested; run publish first")
+        if path.name not in registry.existing(name) and path.name not in pending:  # the low NiFi downloads it from there
+            warn(f"{path.name} is not in the registry, not requested")
             continue
         wanted.append(path)
     if specs and not wanted:
@@ -1410,7 +1113,7 @@ def cmd_request(args) -> int:
     if not wanted:
         progress("nothing new to request")
         return 0
-    if args.dry_run:
+    if dry_run:
         for path in wanted:
             print(f"would request {path.name}")
         print(f"would post {len(wanted)} file(s) to {url}")
@@ -1433,6 +1136,48 @@ def cmd_request(args) -> int:
                      for entry in body["files"]})
         ledger.save(sent)
     return 0
+
+
+def resend_specs(args) -> Tuple[List[str], bool]:
+    """What to ask for again whatever the ledger says: (NAME[==VERSION] specs, every wheel)."""
+    every = args.resend == "all" or env_flag("MIRROR_RESEND_ALL")
+    specs = parse_specs(os.environ.get("MIRROR_RESEND_PACKAGES", ""), "MIRROR_RESEND_PACKAGES")
+    if args.resend and args.resend != "all":
+        try:
+            text = sys.stdin.read() if args.resend == "-" else Path(args.resend).read_text()
+        except OSError as error:
+            raise UsageError(f"--resend {args.resend}: {error.strerror}") from None
+        specs += parse_specs(text, args.resend)
+    return specs, every
+
+
+def cmd_sync(args) -> int:
+    global STAGING
+    url = os.environ.get("MIRROR_REQUEST_URL", "").strip()
+    if args.resend and not url:
+        raise UsageError("--resend asks the low NiFi again: set MIRROR_REQUEST_URL")
+    specs, every = resend_specs(args)
+    registry = Registry.from_env()
+    targets = find_targets()
+    for target in targets:
+        target.platforms  # noqa: B018 - reading validates platforms.txt and MIRROR_MANYLINUX
+    given = args.staging_dir or os.environ.get("MIRROR_STAGING_DIR")
+    if given:
+        Path(given).mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="pypi-mirror-", dir=given or None) as staging:
+        STAGING = Path(staging)
+        try:
+            if args.dry_run:
+                progress(f"dry run: no download; planning from what is in {WHEELHOUSE}/ now")
+            elif download(targets):
+                return 1
+            pending = publish(registry, args.dry_run)
+        finally:
+            STAGING = None
+    if not url:
+        progress("MIRROR_REQUEST_URL is not set: no request sent, the ledger is unchanged")
+        return 0
+    return request(registry, url, specs, every, args.dry_run, pending)
 
 
 def canonical_version(version: str) -> str:
@@ -1464,17 +1209,23 @@ def wheel_fits(filename: str, target: "Target") -> bool:
                                   for tag in pythons)
 
 
+def parse_specs(text: str, source: str) -> List[str]:
+    """NAME[==VERSION] lines, # comments and blank lines ignored."""
+    specs = []
+    for line in (line.split("#", 1)[0].strip() for line in text.splitlines()):
+        if line:
+            try:
+                specs.append(package_spec(line))
+            except argparse.ArgumentTypeError as error:
+                raise UsageError(f"{source}: {error}") from None
+    return specs
+
+
 def read_specs(args) -> List[str]:
     """The packages to export: operands, then every -T FILE (- is stdin), one NAME[==VERSION] per line."""
     specs = list(args.packages)
     for source in args.files_from or []:
-        text = sys.stdin.read() if str(source) == "-" else Path(source).read_text()
-        for line in (line.split("#", 1)[0].strip() for line in text.splitlines()):
-            if line:
-                try:
-                    specs.append(package_spec(line))
-                except argparse.ArgumentTypeError as error:
-                    raise UsageError(f"{source}: {error}") from None
+        specs += parse_specs(sys.stdin.read() if str(source) == "-" else Path(source).read_text(), str(source))
     return specs
 
 
@@ -1511,11 +1262,8 @@ def cmd_export(args) -> int:
     if args.dry_run:
         for item in wanted:
             print(f"would add {item['file']}")
-        extra_files, head = extras()
         print(f"would write {'standard output' if to_stdout else out_dir / (Path(args.output).name if args.output else bundle_name(kind))}"
-              f" ({len(wanted)} wheel(s), {len(extra_files)} requirements file(s){', git history' if head else ''})")
-        if nifi_target(args) and not to_stdout:
-            print(f"would post to {nifi_target(args)}")
+              f" ({len(wanted)} wheel(s))")
         return 0
     if to_stdout:
         out_dir = Path(tempfile.mkdtemp(prefix="pypi-mirror-"))  # the tar is built here, then streamed and removed
@@ -1523,7 +1271,7 @@ def cmd_export(args) -> int:
     try:
         with tempfile.TemporaryDirectory(dir=out_dir, prefix=".download-") as tmp:  # beside the bundle, not /tmp
             paths = [registry.download(f["file"], f["sha256"], Path(tmp)) for f in wanted]
-            bundle = write_bundle(paths, out_dir, kind, *extras(), name=Path(args.output).name if args.output and not to_stdout else None)
+            bundle = write_bundle(paths, out_dir, kind, name=Path(args.output).name if args.output and not to_stdout else None)
         if to_stdout:
             with open(bundle, "rb") as stream:
                 for chunk in iter(lambda: stream.read(1 << 20), b""):
@@ -1531,8 +1279,6 @@ def cmd_export(args) -> int:
             sys.stdout.buffer.flush()
             return 0
         print(bundle)
-        if nifi_target(args):
-            post_bundle(bundle, nifi_target(args), kind)
         return 0
     finally:
         if to_stdout:
@@ -1540,7 +1286,7 @@ def cmd_export(args) -> int:
 
 
 def inbox_tars(directory: Path) -> List[Path]:
-    """Every tar in a directory, oldest first by the time in its name, so the newest requirements win."""
+    """Every tar in a directory, oldest first by the time in its name."""
     return sorted(directory.glob("*.tar"), key=lambda p: (p.name.rsplit("-", 1)[-1], p.name))
 
 
@@ -1559,13 +1305,6 @@ def cmd_import(args) -> int:
         for number, (bundle, from_inbox) in enumerate(bundles):
             unpacked = Path(tmp) / str(number)
             wheels = read_bundle(bundle, unpacked)
-            if args.git_bundle and (unpacked / "repo.bundle").is_file():
-                shutil.copyfile(unpacked / "repo.bundle", args.git_bundle)
-                progress(f"git history from {bundle.name} written to {args.git_bundle}")
-            if args.requirements and (unpacked / "requirements").is_dir():
-                # Later bundles overwrite earlier ones, so pass them oldest first.
-                shutil.copytree(unpacked / "requirements", args.requirements, dirs_exist_ok=True)
-                progress(f"requirements from {bundle.name} written to {args.requirements}")
             for wheel, _ in wheels:
                 name, _ = name_and_version(wheel.name)
                 if wheel.name in registry.existing(name):
@@ -1589,21 +1328,6 @@ def cmd_import(args) -> int:
     return 0
 
 
-def cmd_prune(args) -> int:
-    registry = Registry.from_env()
-    removed = 0
-    for path in wheel_files(args.dry_run):
-        name, _ = name_and_version(path.name)
-        if path.name in registry.existing(name):
-            if args.dry_run:
-                print(f"would remove: {path}")
-            else:
-                path.unlink()
-            removed += 1
-    progress(f"{'would remove' if args.dry_run else 'removed'} {removed} file(s) the registry already holds")
-    return 0
-
-
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 SPEC_RE = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)(?:==([A-Za-z0-9._+!-]+))?")
 
@@ -1618,6 +1342,8 @@ def package_spec(text: str) -> str:
     if not SPEC_RE.fullmatch(text.strip()):
         raise argparse.ArgumentTypeError(f"{text!r}: expected NAME or NAME==VERSION")
     return text.strip()
+
+
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1641,91 +1367,28 @@ def build_parser() -> argparse.ArgumentParser:
         found.set_defaults(handler=handler)
         return found
 
-    list_ = command("list", cmd_list, "list the targets under packages/ and how each is read",
-                    "  {prog} list\n  {prog} list linux-py3.12 windows-py3.9",
-                    "which targets: every directory under packages/, or the TARGET operands.\n"
-                    "output: one line per target on stdout (python, os, arch, first platform tag, requirement count).\n"
-                    "check it: it changes nothing. An unreadable directory name or an unknown TARGET exits 1.\n\n")
-    list_.add_argument("targets", nargs="*", metavar="TARGET", help="a target directory name under packages/ (default: all)")
-    check = command("check", cmd_check, "fail when a target is misnamed or renovate.json does not hold it to its Python",
-                    "  {prog} check\n  {prog} check linux-py3.12",
-                    "which targets: every directory under packages/, or the TARGET operands.\n"
-                    "what it checks: each directory name reads as <os>-py<X.Y>[-<arch>], platforms.txt parses, and\n"
-                    "renovate.json holds each target to its Python (constraintsFiltering strict, one rule per version).\n"
-                    "output: nothing on success. Each gap is one line on stderr, prefixed with the program name, and\n"
-                    "the exit status is 1. The CI test job runs it.\n"
-                    "check it: echo $? prints 0 when every target is readable and held to its Python.\n\n")
-    check.add_argument("targets", nargs="*", metavar="TARGET", help="a target directory name under packages/ (default: all)")
-    pin = command("pin", cmd_pin, "pin each unpinned requirement to the newest release its target can install",
-                  "  {prog} pin\n  {prog} pin packages/linux-py3.12\n  {prog} pin -n",
-                  "which requirements: every requirements.txt under the PATH operands (default packages/). Only bare\n"
-                  "names are pinned; a line that already has a version is left alone.\n"
-                  "how: pip resolves each target's Python and platform tags without installing, and the newest release it\n"
-                  "can install becomes name==version. Dependencies are downloaded to a temporary directory, never pinned.\n"
-                  "what it writes: the requirements.txt itself. -n prints 'would pin TARGET: name==version' and writes nothing.\n"
-                  "check it: git diff packages/\n\n")
-    pin.add_argument("path", nargs="*", metavar="PATH",
-                     help="a target folder, a requirements.txt, or a folder holding targets (default: packages/)")
-    dry_flag(pin, "print the pins it would write")
-    download = command("download", cmd_download, "pip download every target into wheelhouse/",
-                       "  {prog} download\n  {prog} download linux-py3.12",
-                       "which packages: every line of each target's requirements.txt and all their dependencies, as\n"
-                       "wheels only, for that target's Python and platform tags (pip --only-binary=:all:). A package\n"
-                       "with no wheel (pyspark) is built from its sdist in a podman or docker container of the target's\n"
-                       "Python (MIRROR_BUILD_IMAGE), else with this machine's pip, and kept only if it installs on the\n"
-                       "target (py3-none-any); otherwise it is skipped with a warning that says how to fix it. A wheel\n"
-                       "you copy into wheelhouse/ is used as is. pip's own output streams; when pip goes quiet, a line\n"
-                       "every MIRROR_HEARTBEAT seconds shows the time and MB written. A full disk stops the run.\n"
-                       "sources: PyPI, or what pip reads from PIP_INDEX_URL, HTTPS_PROXY and PIP_CERT.\n"
-                       "what it writes: wheelhouse/, one directory for all targets. A wheel already there is not fetched again.\n"
-                       "check it: ls wheelhouse/ ; skipped lines are listed at the end, exit 0. Exit 1 when every line\n"
-                       "was skipped, which means pip reached nothing.\n\n")
-    download.add_argument("targets", nargs="*", metavar="TARGET", help="a target directory name under packages/ (default: all)")
-    publish = command("publish", cmd_publish, "upload wheelhouse files the registry does not have",
-                      "  {prog} publish\n  {prog} publish --dry-run\n  {prog} publish -t delta\n"
-                      "  {prog} publish -t delta --nifi-url https://nifi.example.com:9099/contentListener",
-                      "which files: every wheel in wheelhouse/ that the registry's simple index does not list. Nothing but\n"
-                      "wheels is uploaded; a Git LFS pointer file is refused by name.\n"
-                      "destination: the project registry from --api-url and --project (in CI, the job's own project).\n"
-                      "what it writes: with -t, one pypi-delta-<UTC time>.tar and its .sha256 in DIR holding just the files\n"
-                      "this run uploaded, plus each target's requirements.txt (MIRROR_BUNDLE_REQUIREMENTS) and the git history\n"
-                      "(MIRROR_BUNDLE_GIT); its path is printed on stdout. A run with nothing new and unchanged extras writes none.\n"
-                      "with --nifi-url (or MIRROR_NIFI_URL), the tar is also POSTed to a NiFi ListenHTTP.\n"
-                      "-n prints 'would upload FILE', 'would bundle N file(s) into PATH' and 'would post to URL'.\n"
-                      "check it: pip index versions <name> against the registry, or sha256sum -c TAR.sha256.\n"
-                      "A file over GitLab's PyPI package file size limit (default 5 GB) is refused, and the error says so.\n\n")
-    dry_flag(publish, "list what would be uploaded")
-    publish.add_argument("-t", "--target-directory", metavar="DIR",
-                         help="also write the files uploaded by this run to a tar in DIR")
-    publish.add_argument("--nifi-url", metavar="URL",
-                         help="with -t, also POST the tar to this NiFi ListenHTTP (or MIRROR_NIFI_URL)")
-    request = command("request", cmd_request, "ask the low NiFi to fetch new wheels from the registry, one by one",
-                      "  {prog} request\n  {prog} request -n\n  {prog} request numpy==2.3.4 pyspark\n  {prog} request --all",
-                      "which files: every wheel in wheelhouse/ the registry holds and the ledger has not recorded as\n"
-                      "requested; PACKAGE operands or -T files name them again whatever the ledger says, and --all (or\n"
-                      "MIRROR_RESEND_ALL) takes every one.\n"
-                      "what it sends: one POST of JSON {registry, files: [{filename, name, version, sha256, size, url}]}\n"
-                      "to --request-url (or MIRROR_REQUEST_URL), with Filename, X-Sha256, X-Artifact-Type\n"
-                      "python-packages-request, X-Artifact-Format json and X-File-Count headers; MIRROR_REQUEST_TOKEN is\n"
-                      "sent as Authorization: Bearer. The low NiFi downloads each url and sends each wheel on its own.\n"
-                      "what it writes: the ledger, after the POST succeeds: in CI the generic package\n"
-                      "pypi-mirror-ledger/v1/ledger.json of this project, else MIRROR_LEDGER or .mirror-ledger.json.\n"
-                      "-n prints 'would request FILE' and changes nothing.\n"
-                      "check it: the low NiFi's queues, then pip index versions <name> against the high registry.\n\n")
-    dry_flag(request, "print what would be requested")
-    request.add_argument("packages", nargs="*", metavar="PACKAGE", type=package_spec,
-                         help="request NAME or NAME==VERSION again, whatever the ledger says")
-    request.add_argument("-T", "--files-from", action="append", metavar="FILE",
-                         help="read more NAME[==VERSION] lines from FILE (- is stdin)")
-    request.add_argument("--all", action="store_true", help="every wheel the registry holds (or MIRROR_RESEND_ALL=true)")
-    request.add_argument("--request-url", metavar="URL", help="the low NiFi ListenHTTP (or MIRROR_REQUEST_URL)")
-    prune = command("prune", cmd_prune, "remove local copies of wheels the registry already has",
-                    "  {prog} prune\n  {prog} prune --dry-run",
-                    "which files: wheels in wheelhouse/ that the registry's simple index lists. They are deleted here only;\n"
-                    "nothing is removed from the registry.\n"
-                    "output: -n prints 'would remove: PATH' for each file and deletes nothing.\n"
-                    "check it: ls wheelhouse/ keeps only what the registry lacks.\n\n")
-    dry_flag(prune, "print the files it would remove")
+    sync = command("sync", cmd_sync, "download every target, upload what the registry lacks, and ask the low NiFi for it",
+                   "  {prog} sync\n  {prog} sync -n\n  {prog} sync --staging-dir /data/pypi-staging\n"
+                   "  {prog} sync --resend all",
+                   "which packages: every line of each packages/<target>/requirements.txt and all their dependencies,\n"
+                   "as wheels for that target's Python and platform. A package with only an sdist is built into a wheel\n"
+                   "in a podman or docker container of the target's Python (MIRROR_BUILD_IMAGE), else with this\n"
+                   "machine's pip; one that still has no wheel is skipped with a warning that says how to fix it.\n"
+                   "A misnamed target directory stops the run before anything is downloaded.\n"
+                   "source: PyPI, or what pip reads from PIP_INDEX_URL, HTTPS_PROXY and PIP_CERT.\n"
+                   "destination: every file in wheelhouse/ the registry lacks is uploaded, so a wheel you commit there\n"
+                   "is published too. With MIRROR_REQUEST_URL, every wheel the ledger has not recorded as sent is\n"
+                   "POSTed to the low NiFi as JSON in batches, and the ledger records each batch NiFi accepts.\n"
+                   "staging: pip and source builds use a temporary directory under --staging-dir (or\n"
+                   "MIRROR_STAGING_DIR, default the system's), removed when the run ends.\n"
+                   "-n downloads nothing and prints 'would upload FILE', 'would request FILE' and 'would post'.\n"
+                   "check it: pip index versions <name> --index-url <the registry's simple index>.\n\n")
+    sync.add_argument("--staging-dir", metavar="DIR",
+                      help="a large disk for pip and source builds (or MIRROR_STAGING_DIR; default the system's temp)")
+    sync.add_argument("--resend", metavar="FILE|all",
+                      help="ask NiFi again for the NAME[==VERSION] lines in FILE (- is stdin), or every wheel, "
+                           "whatever the ledger says (or MIRROR_RESEND_PACKAGES, MIRROR_RESEND_ALL)")
+    dry_flag(sync, "print what would be uploaded and requested")
     export = command("export", cmd_export, "tar every file the registry received since a date, or named packages",
                      "  {prog} export numpy==2.3.4 --target linux-py3.12 -o numpy.tar\n"
                      "  {prog} export -T packages.txt -t /mnt/usb\n"
@@ -1735,13 +1398,12 @@ def build_parser() -> argparse.ArgumentParser:
                      "--target keeps only the wheels that target's Python and platform can install. Dependencies are not\n"
                      "added: name each one. With --since DATE instead, every wheel the registry received on or after that\n"
                      "day. Operands or -T and --since are exclusive; one is required. Needs a token with read_api\n"
-                     "(MIRROR_TOKEN); a CI job token cannot list packages.\n"
+                     "(MIRROR_TOKEN); a CI job token or a deploy token cannot list packages.\n"
                      "source: the registry named by --api-url and --project. Wheels are streamed to disk, never held whole\n"
                      "in memory, and each is checked against its sha256.\n"
-                     "what it writes: pypi-pick-<UTC time>.tar (pypi-since-DATE.. for --since) and its .sha256 in the -t\n"
+                     "destination: pypi-pick-<UTC time>.tar (pypi-since-DATE.. for --since) and its .sha256 in the -t\n"
                      "directory (default .), or exactly -o FILE and FILE.sha256; the path is printed on stdout. -o - streams\n"
                      "the tar to stdout with no .sha256, built in a temporary directory as big as the tar.\n"
-                     "destination: also --nifi-url (or MIRROR_NIFI_URL) POSTs the tar to a NiFi ListenHTTP.\n"
                      "check it: sha256sum -c TAR.sha256 ; tar -tf TAR ; -n prints 'would add FILE' and 'would write TAR'.\n\n")
     export.add_argument("packages", nargs="*", metavar="PACKAGE[==VERSION]", type=package_spec,
                         help="export these packages' wheels instead of a date range; dependencies are not added")
@@ -1757,27 +1419,21 @@ def build_parser() -> argparse.ArgumentParser:
     where.add_argument("-o", "--output", type=Path, metavar="FILE",
                        help="write the tar to FILE, its .sha256 beside it; - writes the tar to stdout, with no .sha256 "
                             "(it needs temporary space as big as the tar)")
-    export.add_argument("--nifi-url", metavar="URL", help="also POST the tar to this NiFi ListenHTTP (or MIRROR_NIFI_URL)")
     dry_flag(export, "print the wheels and the tar it would write")
     imp = command("import", cmd_import, "verify tars and upload what the registry lacks; a directory is an inbox",
-                  "  {prog} import numpy.tar\n  {prog} import /mnt/diode/received\n"
-                  "  {prog} import /mnt/diode/received --requirements packages",
-                  "sources: a tar publish or export wrote, or a directory, which is an inbox: every *.tar in it, oldest\n"
-                  "first by the time in its name. Each inbox tar and its .sha256 are removed once imported (-k keeps them);\n"
+                  "  {prog} import numpy.tar\n  {prog} import /mnt/usb",
+                  "which files: every wheel in each tar.\n"
+                  "sources: a tar export wrote, or a directory, which is an inbox: every *.tar in it, oldest first by\n"
+                  "the time in its name. Each inbox tar and its .sha256 are removed once imported (-k keeps them);\n"
                   "a tar that fails stays. A tar named on the command line is never removed.\n"
                   "checks: the .sha256 beside the tar if there is one, then every wheel against the manifest's sha256.\n"
                   "destination: the registry named by --api-url and --project. A wheel already there is skipped; a wheel\n"
                   "streams from disk, and a file over GitLab's PyPI package file size limit (default 5 GB) is refused by name.\n"
-                  "what else it writes: --requirements DIR gets DIR/<target>/requirements.txt and platforms.txt; --git-bundle FILE\n"
-                  "gets the git history. Pass tars oldest first so the newest requirements win.\n"
                   "-n prints 'would upload FILE' and 'would remove: PATH' and changes nothing.\n"
                   "check it: pip download <name>==<version> --index-url the registry's group simple index.\n\n")
     imp.add_argument("sources", nargs="*", type=Path, metavar="SOURCE",
-                     help="a tar publish or export wrote, or a directory (an inbox) of them")
+                     help="a tar export wrote, or a directory (an inbox) of them")
     imp.add_argument("-k", "--keep", action="store_true", help="leave the tars of an inbox directory in place after importing")
-    imp.add_argument("--requirements", metavar="DIR",
-                     help="also write the bundled requirements.txt and platforms.txt to DIR/<target>/")
-    imp.add_argument("--git-bundle", metavar="FILE", help="also write the bundled git history to FILE")
     dry_flag(imp, "list what would be uploaded and removed")
     return parser
 
@@ -1796,10 +1452,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             parser.error("export needs PACKAGE[==VERSION]..., -T FILE, or --since YYYY-MM-DD (or MIRROR_EXPORT_SINCE)")
     if args.command == "import" and not args.sources:
         parser.error("import needs a tar, or a directory of them")
-    if args.command == "export" and args.output == Path("-") and args.nifi_url:
-        parser.error("-o - writes the tar to stdout: it cannot also go to --nifi-url")
-    if args.command == "publish" and args.nifi_url and not args.target_directory:
-        parser.error("--nifi-url sends the tar publish writes: add -t DIR")
     global QUIET
     QUIET = args.quiet
     if args.api_url:
@@ -1808,8 +1460,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         os.environ["MIRROR_PROJECT"] = args.project
     try:
         linux_platforms(manylinux(), "x86_64")
-        env_flag("MIRROR_BUNDLE_REQUIREMENTS", True)
-        env_flag("MIRROR_BUNDLE_GIT")  # a bad value fails here, before anything is uploaded
+        env_flag("MIRROR_PUBLISH_SDISTS")  # a bad value fails here, before anything is uploaded
         return args.handler(args)
     except UsageError as error:
         parser.error(str(error))

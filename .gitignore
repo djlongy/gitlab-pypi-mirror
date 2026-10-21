@@ -1,8 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
-.last-bundle
 .agent/
 .agents/
-.tmp/
+.mirror-ledger.json
 packages/*/.requirements-pending.txt

@@ -1,15 +1,10 @@
-# Uploads wheelhouse/* to this project's PyPI package registry,
-# skipping every file the registry already has.
-#
-# A pipeline schedule (or Run pipeline with MIRROR_SYNC=true) runs `sync`: it
-# downloads from PyPI inside the job, publishes, and keeps only the files this
-# run uploaded as a short-lived artifact for the high side. That job needs a
-# runner that reaches PyPI, directly or through HTTPS_PROXY. Run pipeline with
-# MIRROR_EXPORT_SINCE=YYYY-MM-DD rebuilds a bundle from the registry after a missed one.
-#
-# Runs on any executor: a docker runner uses PYTHON_IMAGE, a shell runner uses
-# the host. python3 (3.8+) runs mirror.py; without it, publish.sh does the same
-# upload with curl, unzip and sha256sum. No network access beyond this GitLab.
+# test: the unit tests (MIRROR_SKIP_TESTS=true skips them).
+# sync: downloads from PyPI, builds a wheel where only an sdist exists, uploads what the
+#   registry lacks and, with MIRROR_REQUEST_URL, asks the low NiFi for each new wheel.
+#   Runs on a schedule, on Run pipeline with MIRROR_SYNC=true, and on a push to the
+#   default branch. Needs a runner that reaches PyPI, directly or through HTTPS_PROXY.
+# export: Run pipeline with MIRROR_EXPORT_SINCE=YYYY-MM-DD bundles every wheel the
+#   registry received since that day, for carrying by hand.
 
 workflow:
   rules:
@@ -19,24 +14,17 @@ workflow:
     - if: $CI_COMMIT_BRANCH
 
 variables:
-  # Any image with python3 3.8+, or with curl, unzip and sha256sum. Point it at
-  # your internal registry.
+  # Any image with python3 3.8+ and pip. Point it at your internal registry.
   PYTHON_IMAGE: python:3.12-slim
   GIT_DEPTH: "1"
-  # What sync and export bundles carry besides wheels. MIRROR_BUNDLE_GIT needs git in PYTHON_IMAGE.
-  MIRROR_BUNDLE_REQUIREMENTS: "true"
-  MIRROR_BUNDLE_GIT: "false"
-  # Set MIRROR_NIFI_URL (a NiFi ListenHTTP, http(s)://host:port/contentListener) to POST each
-  # bundle there as well; see nifi/flow.py. Unset, bundles stay artifacts only.
 
 default:
   image: $PYTHON_IMAGE
 
 stages:
   - test
-  - publish
+  - sync
 
-# Set MIRROR_SKIP_TESTS=true (CI/CD variable or Run pipeline) to publish without running the tests.
 test:
   stage: test
   rules:
@@ -44,82 +32,35 @@ test:
       when: never
     - when: on_success
   script:
-    - |
-      if command -v python3 >/dev/null 2>&1; then
-        python3 mirror.py check
-        python3 -m unittest discover -s tests
-      else
-        echo "no python3 here: checking publish.sh syntax only"
-        sh -n publish.sh
-      fi
+    - python3 -m unittest discover -s tests
 
-publish:
-  stage: publish
+sync:
+  stage: sync
   # Two pipelines publishing at once would both see a file as missing.
   resource_group: pypi-registry
   script:
-    - |
-      if command -v python3 >/dev/null 2>&1; then
-        python3 mirror.py publish
-      else
-        sh publish.sh
-      fi
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" || $MIRROR_SYNC == "true" || $MIRROR_EXPORT_SINCE
-      when: never
-    # A push to the default branch runs sync, which publishes the wheelhouse too.
-    # Run pipeline / API on the default branch: re-check everything.
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(web|api)$/
-
-# Scheduled mirror, and every push to the default branch: download, publish, and
-# bundle only what this run uploaded.
-sync:
-  stage: publish
-  resource_group: pypi-registry
-  variables:
-    GIT_DEPTH: "0"  # MIRROR_BUNDLE_GIT bundles the full history
-  script:
-    - python3 mirror.py download
-    # With MIRROR_REQUEST_URL, the low NiFi fetches each new wheel from the registry itself, so no
-    # bundle is written: a delta of large wheels is more than GitLab takes as an artifact (HTTP 413).
-    - |
-      if [ -z "$MIRROR_REQUEST_URL" ]; then
-        python3 mirror.py publish -t delta
-      else
-        python3 mirror.py publish
-        if [ -n "$MIRROR_RESEND_PACKAGES" ]; then
-          printf '%s\n' "$MIRROR_RESEND_PACKAGES" | python3 mirror.py request -T -
-        else
-          python3 mirror.py request
-        fi
-      fi
+    # Reads MIRROR_REQUEST_URL, MIRROR_RESEND_PACKAGES and MIRROR_RESEND_ALL itself.
+    - python3 mirror.py sync
   # Keeps the wheelhouse between runs on the same runner, so pip only fetches new files.
   cache:
     key: pypi-wheelhouse
     paths:
       - wheelhouse/
-      - .last-bundle
-  artifacts:
-    name: pypi-delta-$CI_PIPELINE_ID
-    when: always  # a bundle NiFi refused is still downloadable; none with MIRROR_REQUEST_URL
-    paths:
-      - delta/
-    expire_in: 14 days
   rules:
+    - if: $MIRROR_EXPORT_SINCE
+      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && ($CI_PIPELINE_SOURCE == "schedule" || $MIRROR_SYNC == "true")
-    # Every push to the default branch: sync is idempotent and uploads only what the registry lacks.
     # A changes rule cannot work here: compare_to the default branch compares it with itself.
+    # sync uploads only what the registry lacks, so every push to the default branch runs it.
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
 
-# Recovery: every file the registry received since MIRROR_EXPORT_SINCE, in one bundle.
+# Recovery: every wheel the registry received since MIRROR_EXPORT_SINCE, in one tar.
 export:
-  stage: publish
-  # Only export reads the packages API, which the job token cannot. EXPORT_TOKEN
-  # (Reporter, read_api) is for this job alone. A project MIRROR_TOKEN variable
-  # (Developer, api) serves every job instead and takes precedence over this line.
+  stage: sync
+  # Only export reads the packages API, which a job token or deploy token cannot.
+  # EXPORT_TOKEN (Reporter, read_api) is for this job alone.
   variables:
     MIRROR_TOKEN: $EXPORT_TOKEN
-    GIT_DEPTH: "0"
   script:
     - python3 mirror.py export --since "$MIRROR_EXPORT_SINCE" -t bundle
   artifacts:
