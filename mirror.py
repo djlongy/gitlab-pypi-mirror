@@ -1102,8 +1102,8 @@ def request(registry: "Registry", url: str, specs: List[str], every: bool, dry_r
                     not SPEC_RE.fullmatch(spec)[2]
                     or canonical_version(SPEC_RE.fullmatch(spec)[2]) == canonical_version(version)) for spec in specs):
                 continue
-        elif not every and path.name in sent:
-            continue
+        elif not every and path.name in sent and path.name not in pending:
+            continue  # uploaded again this run: the low registry lost it, so the high one may have too
         if path.name not in registry.existing(name) and path.name not in pending:  # the low NiFi downloads it from there
             warn(f"{path.name} is not in the registry, not requested")
             continue

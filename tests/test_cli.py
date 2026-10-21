@@ -479,6 +479,7 @@ class CliTest(tm.CliMixin, tm.FakeRegistry):
         local = Path(self.tmp.name) / "ledger.json"
         local.write_text(old)
         os.environ["MIRROR_LEDGER"] = str(local)
+        self.assertEqual(self.run_cli("sync")[0], 0, self.err)  # uploads it; no request URL, so no request
         os.environ["MIRROR_REQUEST_URL"] = self.request_url()
         self.assertEqual(self.run_cli("sync")[0], 0, self.err)
         self.assertIn("nothing new to request", self.err)

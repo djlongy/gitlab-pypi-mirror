@@ -674,5 +674,19 @@ class RequestContractTests(unittest.TestCase):
         self.assertEqual(sent["X-Sha256"], mirror.hashlib.sha256(raw).hexdigest())
 
 
+    def test_a_file_uploaded_again_is_requested_again_though_the_ledger_has_it(self):
+        sent = {"a-1.0-py3-none-any.whl": {}, "b-1.0-py3-none-any.whl": {}}
+        ledger = mock.Mock(load=mock.Mock(return_value=dict(sent)))
+        registry = mock.Mock(existing=mock.Mock(return_value=set(sent)))
+        posted = []
+        with mock.patch.object(mirror, "Ledger", return_value=ledger), \
+                mock.patch.object(mirror, "wheel_files", return_value=[Path(n) for n in sorted(sent)]), \
+                mock.patch.object(mirror, "request_body", lambda r, files: {"files": [
+                    {"filename": f.name, "sha256": "0"} for f in files]}), \
+                mock.patch.object(mirror, "post_request", lambda body, url: posted.extend(
+                    f["filename"] for f in body["files"])):
+            mirror.request(registry, "http://nifi.test/pypi-request", [], False, False, {"b-1.0-py3-none-any.whl"})
+        self.assertEqual(posted, ["b-1.0-py3-none-any.whl"])
+
 if __name__ == "__main__":
     unittest.main()
