@@ -175,6 +175,21 @@ keep:
           urllib.request.urlopen(request, context=context, timeout=120).close()
           print(f"kept: pypi-mirror-sbom/{day}/{file.name}")
       '
+    # With DTRACK_URL (and a masked DTRACK_API_KEY with BOM_UPLOAD and PROJECT_CREATION_UPLOAD), the SBOM also
+    # goes to Dependency-Track, which keeps checking it against new advisories. A failure only warns.
+    - |
+      if [ -n "$DTRACK_URL" ]; then
+        python3 -c '
+      import base64, datetime, json, os, urllib.request
+      body = {"projectName": "pypi-mirror", "projectVersion": datetime.date.today().isoformat(), "autoCreate": True,
+              "bom": base64.b64encode(open("sbom/pypi-mirror.cdx.json", "rb").read()).decode()}
+      request = urllib.request.Request(os.environ["DTRACK_URL"].rstrip("/") + "/api/v1/bom", method="PUT",
+                                       data=json.dumps(body).encode(),
+                                       headers={"X-Api-Key": os.environ["DTRACK_API_KEY"], "Content-Type": "application/json"})
+      with urllib.request.urlopen(request, timeout=120) as response:
+          print("Dependency-Track: pypi-mirror", body["projectVersion"], "token", json.load(response)["token"])
+      ' || echo "Dependency-Track upload failed; the SBOM is kept in the package registry"
+      fi
 
 # Recovery: every wheel the registry received since MIRROR_EXPORT_SINCE, in one tar.
 export:

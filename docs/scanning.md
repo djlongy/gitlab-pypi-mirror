@@ -34,3 +34,10 @@ for wheel in wheelhouse/*.whl; do unzip -q "$wheel" '*.dist-info/*' -d "sbom/whe
 syft scan dir:sbom/wheels -o cyclonedx-json=sbom/pypi-mirror.cdx.json
 grype sbom:sbom/pypi-mirror.cdx.json --only-fixed
 ```
+
+## Dependency-Track
+
+Set the project CI variables `DTRACK_URL` (the API base, for example `https://dtrack-api.example.com`) and
+`DTRACK_API_KEY` (masked, a key with `BOM_UPLOAD` and `PROJECT_CREATION_UPLOAD`). `keep` then also sends the
+SBOM to Dependency-Track as project `pypi-mirror`, version `<YYYY-MM-DD>`, and Dependency-Track keeps
+checking it against new advisories. A failed upload only warns: the SBOM is still in the package registry.

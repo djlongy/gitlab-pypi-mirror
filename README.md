@@ -45,7 +45,7 @@ The webhook is small JSON POSTs of `MIRROR_REQUEST_BATCH` wheels, naming each wh
 
 Jobs: `test` (skipped with `MIRROR_SKIP_TESTS=true`), `sync`, and `export` (Run pipeline with `MIRROR_EXPORT_SINCE=YYYY-MM-DD` and a masked `EXPORT_TOKEN`, Reporter, `read_api`). The sync job caches `wheelhouse/`, so pip fetches only new files.
 
-With `MIRROR_SCAN=true` (a schedule variable or Run pipeline), `sbom`, `scan` and `keep` follow sync: a Syft SBOM of every wheel, a Grype scan that fails on a fixable `GRYPE_FAIL_ON` vulnerability, and both kept in the generic package `pypi-mirror-sbom`. Grype needs `grype.anchore.io` through the proxy or `GRYPE_DB_UPDATE_URL`. See [docs/scanning.md](docs/scanning.md).
+With `MIRROR_SCAN=true` (a schedule variable or Run pipeline), `sbom`, `scan` and `keep` follow sync: a Syft SBOM of every wheel, a Grype scan that fails on a fixable `GRYPE_FAIL_ON` vulnerability, and both kept in the generic package `pypi-mirror-sbom`. Grype needs `grype.anchore.io` through the proxy or `GRYPE_DB_UPDATE_URL`. With `DTRACK_URL` and `DTRACK_API_KEY` set, `keep` also sends the SBOM to Dependency-Track. See [docs/scanning.md](docs/scanning.md).
 
 ## Fallback: export and import by hand
 
