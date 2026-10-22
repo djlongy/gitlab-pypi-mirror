@@ -237,29 +237,56 @@ def name_and_version(filename: str) -> tuple:
 
 
 METADATA_LIMIT = 4 << 20  # torch's METADATA is 40 KB; a few MB is any real one, a zip bomb is not
+SDIST_SCAN_LIMIT = 1 << 30  # bytes of a tar.gz decompressed while looking for PKG-INFO, so a gzip bomb stops
 
 
 def read_metadata(path: Path) -> Dict[str, str]:
-    """The core metadata headers of a wheel, or {} when it has none (an sdist: its name and version are enough)."""
-    if not path.name.endswith(".whl"):
+    """The core metadata headers of a wheel (its top-level .dist-info/METADATA, which pip reads) or an sdist (its
+    top-level PKG-INFO), or {} when it has none. Each value on one line: a folded header cannot become a newline."""
+    if path.name.endswith(".whl"):
+        noun, kind = "wheel", "METADATA"
+        member_of = lambda name: name.count("/") == 1 and name.endswith(".dist-info/METADATA")  # noqa: E731
+    elif is_sdist(path.name):
+        noun, kind = "source distribution", "PKG-INFO"
+        member_of = lambda name: name.count("/") == 1 and name.endswith("/PKG-INFO")  # noqa: E731
+    else:
         return {}
     try:
-        with zipfile.ZipFile(path) as archive:
-            member = next((i for i in archive.infolist() if i.filename.endswith(".dist-info/METADATA")), None)
-            if member and member.file_size > METADATA_LIMIT:
-                raise MirrorError(f"{path.name}: METADATA is {member.file_size} bytes, more than {METADATA_LIMIT}")
-            raw = archive.read(member) if member else b""
-    except zipfile.BadZipFile as error:
+        if path.name.endswith(".tar.gz"):
+            # ponytail: a tar.gz has no index, so this reads up to PKG-INFO; it is near the start in every sdist seen.
+            with tarfile.open(path, "r:gz") as archive:
+                member = None
+                for entry in archive:
+                    if entry.isfile() and member_of(entry.name):
+                        member = entry
+                        break
+                    if archive.offset > SDIST_SCAN_LIMIT:
+                        warn(f"{path.name}: no PKG-INFO in its first {SDIST_SCAN_LIMIT} bytes, read without metadata")
+                        break
+                raw = archive.extractfile(member).read(METADATA_LIMIT + 1) if member else b""
+        else:
+            with zipfile.ZipFile(path) as archive:
+                members = [i for i in archive.infolist() if member_of(i.filename)]
+                if len(members) > 1:  # pip refuses such a wheel too
+                    raise MirrorError(f"{path.name}: {len(members)} top-level {kind} files, a {noun} has one")
+                member = members[0] if members else None
+                if member and member.file_size > METADATA_LIMIT:
+                    raise MirrorError(f"{path.name}: {kind} is {member.file_size} bytes, more than {METADATA_LIMIT}")
+                # Read no more than the limit whatever the header says the size is.
+                raw = archive.open(member).read(METADATA_LIMIT + 1) if member else b""
+    except (zipfile.BadZipFile, tarfile.TarError, EOFError, OSError) as error:
         with open(path, "rb") as handle:
             if handle.read(40).startswith(b"version https://git-lfs"):
-                raise MirrorError(f"{path.name}: a Git LFS pointer, not a wheel. This checkout has no git-lfs: "
+                raise MirrorError(f"{path.name}: a Git LFS pointer, not a {noun}. This checkout has no git-lfs: "
                                   "install it where this runs, or delete .gitattributes and commit the wheels as "
                                   "ordinary files") from error
-        raise MirrorError(f"{path.name}: unreadable wheel: {error}") from error
+        raise MirrorError(f"{path.name}: unreadable {noun}: {error}") from error
+    if len(raw) > METADATA_LIMIT:
+        raise MirrorError(f"{path.name}: {kind} is more than {METADATA_LIMIT} bytes")
     if not raw:
         return {}
     headers = email.parser.BytesHeaderParser().parsebytes(raw)
-    return {key: str(value) for key, value in headers.items()}
+    return {key: " ".join(str(value).split()) for key, value in headers.items()}
 
 
 # --- GitLab registry ----------------------------------------------------------
@@ -943,14 +970,17 @@ def download(targets: List[Target]) -> int:
     return 0
 
 
-def publish(registry: "Registry", dry_run: bool) -> Set[str]:
-    """Upload every wheelhouse file the registry lacks. Returns the names uploaded (or that would be)."""
+def publish(registry: "Registry", dry_run: bool, ledger: Optional["Ledger"] = None) -> Set[str]:
+    """Upload every wheelhouse file the registry lacks. Returns the names uploaded (or that would be).
+
+    With a ledger, the files about to be uploaded are dropped from it first: a run that uploads one and then fails
+    before its request leaves it in the registry, and the next run asks for it only if the ledger does not say sent."""
     files = wheel_files()
+    missing = [path for path in files if path.name not in registry.existing(name_and_version(path.name)[0])]
+    if ledger and missing and not dry_run:
+        ledger.forget({path.name for path in missing})
     uploaded: Set[str] = set()
-    for path in files:
-        name, _ = name_and_version(path.name)
-        if path.name in registry.existing(name):
-            continue
+    for path in missing:
         if dry_run:
             print(f"would upload {path.name}")
         else:
@@ -1029,16 +1059,26 @@ class Ledger:
             self.path.write_bytes(body)
         progress(f"ledger: {self.where()} records {len(sent)} sent file(s)")
 
+    def forget(self, names: Set[str]) -> None:
+        """Drop names from the ledger, so the next request asks for them whatever happens to this run."""
+        sent = self.load()
+        if names & sent.keys():
+            self.save({name: entry for name, entry in sent.items() if name not in names})
+
 
 def request_body(registry: "Registry", files: List[Path]) -> Dict[str, object]:
-    """The JSON the low NiFi reads: one entry per wheel, with the URL it downloads it from."""
+    """The JSON the low NiFi reads: one entry per wheel, with the URL it downloads it from and, when the wheel's
+    METADATA has one, its Requires-Python, which the high side uploads with it."""
     entries = []
     for path in files:
         name, version = name_and_version(path.name)
         digest = sha256_file(path)
-        entries.append({"filename": path.name, "name": name, "version": version, "sha256": digest,
-                        "size": path.stat().st_size,
-                        "url": f"{registry.base}/files/{digest}/{urllib.parse.quote(path.name)}"})
+        entry = {"filename": path.name, "name": name, "version": version, "sha256": digest,
+                 "size": path.stat().st_size, "url": f"{registry.base}/files/{digest}/{urllib.parse.quote(path.name)}"}
+        requires_python = read_metadata(path).get("Requires-Python")
+        if requires_python:
+            entry["requires_python"] = requires_python
+        entries.append(entry)
     return {"registry": registry.base, "files": entries}
 
 
@@ -1056,6 +1096,16 @@ def ci_attributes() -> Dict[str, str]:
     """The CI_* variables that are set and non-empty, as attributes; none outside GitLab CI."""
     found = {name: header_value(os.environ.get(variable, "")) for name, variable in CI_ATTRIBUTES.items()}
     return {name: value for name, value in found.items() if value}
+
+
+def shown_url(url: str) -> str:
+    """url with no user:password@, query or fragment, so a log never shows credentials or a token. The last @
+    counts, so a password holding an unencoded / or @ is not printed either."""
+    scheme, separator, rest = url.partition("://")
+    if not separator:
+        scheme, rest = "", url
+    rest = re.split(r"[?#]", rest, maxsplit=1)[0]
+    return f"{scheme}{separator}{rest.rpartition('@')[2]}"
 
 
 def post_request(body: Dict[str, object], url: str) -> None:
@@ -1081,17 +1131,21 @@ def post_request(body: Dict[str, object], url: str) -> None:
     try:
         conn.request("POST", target, body=data, headers=headers)
         status = conn.getresponse().status
+        progress(f"posted to NiFi: {headers['Filename']} -> {shown_url(url)} (HTTP {status}, {len(body['files'])} file(s), "
+                 f"{len(data)} bytes)")
     except OSError as error:
-        raise MirrorError(f"POST request to {url}: {error}") from error
+        raise MirrorError(f"POST request to {shown_url(url)}: {error}") from error
     finally:
         conn.close()
     if not 200 <= status < 300:
-        raise MirrorError(f"POST request to {url}: HTTP {status}")
+        raise MirrorError(f"POST request to {shown_url(url)}: HTTP {status}")
 
 
 def request(registry: "Registry", url: str, specs: List[str], every: bool, dry_run: bool,
             pending: Set[str]) -> int:
     """POST the wheels the ledger has not recorded as sent, or the ones named, to the low NiFi."""
+    progress(f"MIRROR_REQUEST_URL is set: asking the low NiFi at {shown_url(url)} for "
+             + ("every wheel again" if every else "the named wheels" if specs else "the wheels not yet sent"))
     ledger = Ledger(registry)
     sent = ledger.load()
     wanted = []
@@ -1111,12 +1165,12 @@ def request(registry: "Registry", url: str, specs: List[str], every: bool, dry_r
     if specs and not wanted:
         raise MirrorError(f"nothing in {WHEELHOUSE}/ and the registry matches {', '.join(specs)}")
     if not wanted:
-        progress("nothing new to request")
+        progress(f"nothing new to request: every wheel is in the ledger as sent ({len(sent)} file(s)), nothing posted to NiFi")
         return 0
     if dry_run:
         for path in wanted:
             print(f"would request {path.name}")
-        print(f"would post {len(wanted)} file(s) to {url}")
+        print(f"would post {len(wanted)} file(s) to {shown_url(url)}")
         return 0
     # One POST per batch keeps each body under a proxy's size limit (nginx ingress allows 1 MB by default).
     size = int(os.environ.get("MIRROR_REQUEST_BATCH") or 200)
@@ -1129,7 +1183,7 @@ def request(registry: "Registry", url: str, specs: List[str], every: bool, dry_r
             left = len(wanted) - (number - 1) * size
             raise MirrorError(f"{error}; batch {number} of {len(batches)} failed, {left} file(s) not sent: "
                               "the ledger keeps the batches before it, and the next run asks for the rest") from error
-        progress(f"requested {len(batch)} file(s) from {url} (batch {number} of {len(batches)})")
+        progress(f"requested {len(batch)} file(s) from the low NiFi (batch {number} of {len(batches)})")
         when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         pipeline = os.environ.get("CI_PIPELINE_URL", "")
         sent.update({entry["filename"]: {"sha256": entry["sha256"], "time": when, "pipeline": pipeline}
@@ -1171,11 +1225,11 @@ def cmd_sync(args) -> int:
                 progress(f"dry run: no download; planning from what is in {WHEELHOUSE}/ now")
             elif download(targets):
                 return 1
-            pending = publish(registry, args.dry_run)
+            pending = publish(registry, args.dry_run, Ledger(registry) if url else None)
         finally:
             STAGING = None
     if not url:
-        progress("MIRROR_REQUEST_URL is not set: no request sent, the ledger is unchanged")
+        progress("MIRROR_REQUEST_URL is not set: nothing posted to NiFi, the ledger is unchanged")
         return 0
     return request(registry, url, specs, every, args.dry_run, pending)
 

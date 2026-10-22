@@ -184,6 +184,29 @@ def make_wheel(directory: Path, filename: str, requires_python: str = "") -> Pat
     return path
 
 
+def make_sdist(directory: Path, filename: str, requires_python: str = "") -> Path:
+    """A source distribution, tar.gz or zip, whose top-level PKG-INFO has Requires-Python when given."""
+    name, version = mirror.name_and_version(filename)
+    path, top = directory / filename, f"{name}-{version}"
+    pkg_info = f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+    if requires_python:
+        pkg_info += f"Requires-Python: {requires_python}\n"
+    # A PKG-INFO deeper down belongs to an egg-info, not to the sdist.
+    members = {f"{top}/{name}.egg-info/PKG-INFO": "Requires-Python: >=9\n", f"{top}/PKG-INFO": pkg_info,
+               f"{top}/setup.py": ""}
+    if filename.endswith(".zip"):
+        with zipfile.ZipFile(path, "w") as archive:
+            for member, text in members.items():
+                archive.writestr(member, text)
+    else:
+        with tarfile.open(path, "w:gz") as archive:
+            for member, text in members.items():
+                info = tarfile.TarInfo(member)
+                info.size = len(text.encode())
+                archive.addfile(info, io.BytesIO(text.encode()))
+    return path
+
+
 class CliMixin:
     def run_cli(self, *argv):
         """main() with both streams captured: returns (exit code, stdout) and leaves stderr in self.err."""
@@ -413,6 +436,18 @@ class RegistryTests(CliMixin, FakeRegistry):
         self.assertNotIn("pkg", FakeGitLab.files)
         self.assertIn("ignoring wheelhouse/pkg-0.1.tar.gz", self.err)
 
+    def test_an_sdist_is_uploaded_with_the_requires_python_of_its_pkg_info(self):
+        wheelhouse = self.target("linux-py3.12")
+        make_sdist(wheelhouse, "six-1.17.0.tar.gz", ">=2.7, !=3.0.*")
+        make_sdist(wheelhouse, "pyreadline-2.1.zip", ">=3.6")
+        make_sdist(wheelhouse, "docopt-0.6.2.tar.gz")
+        with mock.patch.dict(os.environ, {"MIRROR_PUBLISH_SDISTS": "true"}):
+            code, out = self.run_cli("sync")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(FakeGitLab.files["six"]["six-1.17.0.tar.gz"]["requires_python"], ">=2.7, !=3.0.*")
+        self.assertEqual(FakeGitLab.files["pyreadline"]["pyreadline-2.1.zip"]["requires_python"], ">=3.6")
+        self.assertNotIn("requires_python", FakeGitLab.files["docopt"]["docopt-0.6.2.tar.gz"])
+
     def test_a_git_lfs_pointer_is_named_as_one(self):
         """A runner without git-lfs checks out pointer files under the wheels' names."""
         (self.target("linux-py3.12") / "idna-3.20-py3-none-any.whl").write_text(
@@ -617,6 +652,13 @@ class HardeningTests(unittest.TestCase):
         for name in secret.keys() - {"KEEP_ME"}:
             self.assertNotIn(f"'{name}'", names)
 
+    def test_an_sdist_that_is_a_git_lfs_pointer_is_named_as_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "six-1.17.0.tar.gz"
+            path.write_text("version https://git-lfs.github.com/spec/v1\noid sha256:" + "0" * 64 + "\nsize 70\n")
+            with self.assertRaisesRegex(mirror.MirrorError, "a Git LFS pointer, not a source distribution"):
+                mirror.read_metadata(path)
+
     def test_a_huge_metadata_is_refused_before_it_is_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bomb-1.0-py3-none-any.whl"
@@ -624,6 +666,34 @@ class HardeningTests(unittest.TestCase):
                 archive.writestr("bomb-1.0.dist-info/METADATA", b"A" * (mirror.METADATA_LIMIT + 1))
             with self.assertRaisesRegex(mirror.MirrorError, "METADATA is"):
                 mirror.read_metadata(path)
+
+    def test_only_the_top_level_metadata_counts_and_two_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pkg-1.0-py3-none-any.whl"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("vendor/evil-1.0.dist-info/METADATA", "Requires-Python: >=2\n")
+                archive.writestr("pkg-1.0.dist-info/METADATA", "Name: pkg\nRequires-Python: >=3.9,\n <4\n")
+            self.assertEqual(mirror.read_metadata(path)["Requires-Python"], ">=3.9, <4", "folded onto one line")
+            with zipfile.ZipFile(path, "a") as archive:
+                archive.writestr("evil-1.0.dist-info/METADATA", "Requires-Python: >=2\n")
+            with self.assertRaisesRegex(mirror.MirrorError, "2 top-level METADATA files"):
+                mirror.read_metadata(path)
+
+    def test_an_sdist_scan_stops_at_the_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_sdist(Path(tmp), "six-1.17.0.tar.gz", ">=3.8")
+            self.assertEqual(mirror.read_metadata(path)["Requires-Python"], ">=3.8")
+            with mock.patch.object(mirror, "SDIST_SCAN_LIMIT", 0), mock.patch.object(mirror, "warn") as warned:
+                self.assertEqual(mirror.read_metadata(path), {})
+            self.assertIn("no PKG-INFO in its first 0 bytes", warned.call_args[0][0])
+
+    def test_a_logged_url_has_no_credentials_query_or_fragment(self):
+        for url, shown in (("https://u:p@nifi.example.com/req?token=t#x", "https://nifi.example.com/req"),
+                           ("https://ci:s3cr/et@nifi.example.com/req", "https://nifi.example.com/req"),
+                           ("http://nifi.example.com:9099/req", "http://nifi.example.com:9099/req"),
+                           ("u:p@nifi.example.com/req", "nifi.example.com/req")):
+            with self.subTest(url=url):
+                self.assertEqual(mirror.shown_url(url), shown)
 
     def test_a_manifest_naming_a_file_outside_the_bundle_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -672,6 +742,15 @@ class RequestContractTests(unittest.TestCase):
         self.assertEqual((sent["X-Artifact-Type"], sent["X-Registry"], sent["X-File-Count"], sent["X-CI-Project"]),
                          ("python-packages-request", body["registry"], "1", "platform/pypi-mirror"))
         self.assertEqual(sent["X-Sha256"], mirror.hashlib.sha256(raw).hexdigest())
+
+    def test_each_entry_carries_requires_python_when_the_wheel_has_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            files = [make_wheel(Path(tmp), "certifi-2025.1.31-py3-none-any.whl", ">=3.7"),
+                     make_wheel(Path(tmp), "six-1.17.0-py2.py3-none-any.whl")]
+            body = mirror.request_body(mock.Mock(base="https://gitlab.example.com/api/v4/projects/12/packages/pypi"), files)
+        certifi, six = body["files"]
+        self.assertEqual(certifi["requires_python"], ">=3.7")
+        self.assertNotIn("requires_python", six)
 
 
     def test_a_file_uploaded_again_is_requested_again_though_the_ledger_has_it(self):
