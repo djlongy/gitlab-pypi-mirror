@@ -401,6 +401,8 @@ class CliTest(tm.CliMixin, tm.FakeRegistry):
         self.assertEqual((headers["X-Artifact-Type"], headers["X-Artifact-Format"], headers["X-File-Count"]),
                          ("python-packages-request", "json", "2"))
         self.assertRegex(filename, r"^pypi-request-\d{8}T\d{9}Z\.json$")
+        self.assertIn(f"MIRROR_REQUEST_URL is set: asking the low NiFi at {self.request_url()}", self.err)
+        self.assertIn(f"posted to NiFi: {filename} -> {self.request_url()} (HTTP 200, 2 file(s), ", self.err)
         self.assertEqual(headers["X-Registry"], body["registry"])  # as gitlab-registry-mirror's request
         entry = next(f for f in body["files"] if f["filename"] == idna.name)
         self.assertEqual((entry["name"], entry["version"], entry["sha256"], entry["size"]),
@@ -442,15 +444,31 @@ class CliTest(tm.CliMixin, tm.FakeRegistry):
     def test_a_failed_request_is_asked_for_again(self):
         tm.make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")
         os.environ["MIRROR_REQUEST_URL"] = self.request_url()
+        os.environ["MIRROR_REQUEST_URL"] = self.request_url().replace("//", "//user:secret@")
         self.server.post_status = 503  # NiFi back pressure
         code, _ = self.run_cli("sync")
         self.assertEqual(code, 1)
         self.assertIn("HTTP 503", self.err)
+        self.assertNotIn("secret", self.err, "no credentials in the log")
         self.assertIsNone(self.ledger())
         self.assertIn("idna", tm.FakeGitLab.files, "the upload stands")
         self.server.post_status = 200
         self.assertEqual(self.run_cli("sync")[0], 0)
         self.assertEqual(list(self.ledger()["sent"]), ["idna-3.20-py3-none-any.whl"])
+
+    def test_a_file_uploaded_again_is_asked_for_again_after_a_failed_request(self):
+        """The ledger said sent, the low registry lost the file, and the run that uploaded it again failed to ask."""
+        tm.make_wheel(self.target("linux-py3.12"), "idna-3.20-py3-none-any.whl")
+        os.environ["MIRROR_REQUEST_URL"] = self.request_url()
+        self.assertEqual(self.run_cli("sync")[0], 0, self.err)
+        tm.FakeGitLab.files.clear()
+        self.server.post_status = 503
+        self.assertEqual(self.run_cli("sync")[0], 1)
+        self.assertEqual(self.ledger()["sent"], {}, "dropped before the upload")
+        self.server.post_status = 200
+        self.assertEqual(self.run_cli("sync")[0], 0, self.err)
+        self.assertEqual([f["filename"] for f in json.loads(self.server.posted[-1][2])["files"]],
+                         ["idna-3.20-py3-none-any.whl"])
 
     def test_sync_posts_batches_and_records_each_before_the_next(self):
         wheelhouse = self.target("linux-py3.12")
