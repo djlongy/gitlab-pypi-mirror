@@ -5,6 +5,8 @@
 #   default branch. Needs a runner that reaches PyPI, directly or through HTTPS_PROXY.
 # export: Run pipeline with MIRROR_EXPORT_SINCE=YYYY-MM-DD bundles every wheel the
 #   registry received since that day, for carrying by hand.
+# sbom, scan, keep: with MIRROR_SCAN=true, after sync, a Syft SBOM of every wheel in the wheelhouse,
+#   a Grype scan of it, and both kept in the generic package pypi-mirror-sbom. See docs/scanning.md.
 
 workflow:
   rules:
@@ -17,6 +19,19 @@ variables:
   # Any image with python3 3.8+ and pip. Point it at your internal registry.
   PYTHON_IMAGE: python:3.12-slim
   GIT_DEPTH: "1"
+  # Debug variants carry a busybox shell; the binaries are /syft and /grype.
+  SYFT_IMAGE: docker.io/anchore/syft:v1.54.0-debug
+  GRYPE_IMAGE: docker.io/anchore/grype:v0.120.0-debug
+  # scan fails on a vulnerability this severe or worse that has a fixed version. Empty: report only.
+  GRYPE_FAIL_ON: critical
+  # The check for a newer Grype release only adds an error line where toolbox-data.anchore.io is blocked.
+  GRYPE_CHECK_FOR_APP_UPDATE: "false"
+  MIRROR_SCAN:
+    value: "false"
+    options: ["false", "true"]
+    description: >-
+      true adds an SBOM and a vulnerability scan of every wheel after sync. Grype needs its database:
+      grype.anchore.io through the proxy, or a copy you host (GRYPE_DB_UPDATE_URL).
 
 default:
   image: $PYTHON_IMAGE
@@ -24,6 +39,7 @@ default:
 stages:
   - test
   - sync
+  - scan
 
 test:
   stage: test
@@ -41,6 +57,33 @@ sync:
   script:
     # Reads MIRROR_REQUEST_URL, MIRROR_RESEND_PACKAGES and MIRROR_RESEND_ALL itself.
     - python3 mirror.py sync
+    # Syft cannot read a .whl, so unpack each wheel's .dist-info (name, version, licence, file list) for the
+    # sbom job. A .dist-info a wheel vendors deeper down is listed too.
+    - |
+      if [ "$MIRROR_SCAN" = true ]; then
+        python3 -c '
+      import pathlib, sys, zipfile
+      # Both folders mirror.py publishes from: the wheelhouse and the wheels committed to wheelhouse/.
+      wheels = {w.name: w for folder in sys.argv[1:] for w in sorted(pathlib.Path(folder).glob("*.whl"))}
+      unpacked = 0
+      pathlib.Path("sbom/wheels").mkdir(parents=True, exist_ok=True)
+      for name, wheel in sorted(wheels.items()):
+          try:
+              with zipfile.ZipFile(wheel) as archive:
+                  members = [m for m in archive.infolist() if ".dist-info/" in m.filename]
+                  if sum(m.file_size for m in members) > 64 << 20:
+                      raise zipfile.BadZipFile(".dist-info over 64 MiB")
+                  archive.extractall(f"sbom/wheels/{name}", members)
+                  unpacked += 1
+          except zipfile.BadZipFile as error:
+              print(f"sbom: {name} left out of the SBOM: {error}")
+      print(f"sbom: unpacked the .dist-info of {unpacked} of {len(wheels)} wheel(s)")
+      ' "${MIRROR_WHEELHOUSE_DIR:-wheelhouse}" wheelhouse
+      fi
+  artifacts:
+    paths:
+      - sbom/
+    expire_in: 1 week
   # Keeps the wheelhouse between runs on the same runner, so pip only fetches new files.
   cache:
     key: pypi-wheelhouse
@@ -49,10 +92,89 @@ sync:
   rules:
     - if: $MIRROR_EXPORT_SINCE
       when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && ($CI_PIPELINE_SOURCE == "schedule" || $MIRROR_SYNC == "true")
+    - &sync-runs
+      if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && ($CI_PIPELINE_SOURCE == "schedule" || $MIRROR_SYNC == "true")
     # A changes rule cannot work here: compare_to the default branch compares it with itself.
     # sync uploads only what the registry lacks, so every push to the default branch runs it.
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+    - &sync-pushed
+      if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+
+# sbom and scan run after every sync when MIRROR_SCAN is true.
+.after-sync: &after-sync
+  stage: scan
+  rules:
+    - if: $MIRROR_SCAN != "true" || $MIRROR_EXPORT_SINCE
+      when: never
+    - *sync-runs
+    - *sync-pushed
+
+# One CycloneDX SBOM listing every wheel sync holds.
+sbom:
+  <<: *after-sync
+  image:
+    name: $SYFT_IMAGE
+    entrypoint: [""]
+  needs: [sync]
+  script:
+    - /syft scan dir:sbom/wheels --source-name pypi-mirror -o cyclonedx-json=sbom/pypi-mirror.cdx.json
+  artifacts:
+    paths:
+      - sbom/pypi-mirror.cdx.json
+    expire_in: 1 week
+
+# Fails on GRYPE_FAIL_ON, after sync: the wheels are in the registry already, the failure says which to update.
+scan:
+  <<: *after-sync
+  image:
+    name: $GRYPE_IMAGE
+    entrypoint: [""]
+    docker:
+      user: root  # the image runs as uid 65532, which cannot write the job's checkout
+  needs: [sbom]
+  variables:
+    GRYPE_DB_CACHE_DIR: $CI_PROJECT_DIR/.grype-db
+  script:
+    - |
+      if ! /grype db update; then
+        echo "no vulnerability database from ${GRYPE_DB_UPDATE_URL:-https://grype.anchore.io/databases}:" \
+          "allow it through the proxy or host a copy, see docs/scanning.md"
+        exit 1
+      fi
+      /grype db status
+    - /grype sbom:sbom/pypi-mirror.cdx.json --only-fixed ${GRYPE_FAIL_ON:+--fail-on "$GRYPE_FAIL_ON"}
+        -o table -o json=sbom/pypi-mirror.grype.json
+  artifacts:
+    when: always
+    paths:
+      - sbom/pypi-mirror.cdx.json
+      - sbom/pypi-mirror.grype.json
+    expire_in: 1 week
+
+# Keeps the day's SBOM and report in the generic package pypi-mirror-sbom/<YYYY-MM-DD>/, also when scan failed.
+keep:
+  stage: scan
+  needs: [scan]
+  rules:
+    - if: $MIRROR_SCAN != "true" || $MIRROR_EXPORT_SINCE
+      when: never
+    - <<: *sync-runs
+      when: always
+    - <<: *sync-pushed
+      when: always
+  script:
+    - |
+      python3 -c '
+      import datetime, os, pathlib, ssl, urllib.request
+      day = datetime.date.today().isoformat()
+      api, project = os.environ["CI_API_V4_URL"], os.environ["CI_PROJECT_ID"]
+      context = ssl.create_default_context(cafile=os.environ.get("CI_SERVER_TLS_CA_FILE") or None)
+      for file in sorted(pathlib.Path("sbom").glob("pypi-mirror.*.json")):
+          url = f"{api}/projects/{project}/packages/generic/pypi-mirror-sbom/{day}/{file.name}"
+          request = urllib.request.Request(url, data=file.read_bytes(), method="PUT",
+                                           headers={"JOB-TOKEN": os.environ["CI_JOB_TOKEN"]})
+          urllib.request.urlopen(request, context=context, timeout=120).close()
+          print(f"kept: pypi-mirror-sbom/{day}/{file.name}")
+      '
 
 # Recovery: every wheel the registry received since MIRROR_EXPORT_SINCE, in one tar.
 export:
